@@ -30,7 +30,10 @@ _COMMON_OPTS = {
 
     "extractor_args": {
         "youtube": {
-            "player_client": ["default", "web_embedded"],
+            "player_client": ["mweb"],
+        },
+        "youtubepot-bgutilhttp": {
+            "base_url": "http://127.0.0.1:4416",
         },
     },
 
