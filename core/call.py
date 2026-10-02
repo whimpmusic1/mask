@@ -29,7 +29,7 @@ class Call:
         self.pytgcalls = PyTgCalls(assistant_client)
 
         self.queues: dict[int, MusicQueue] = {}
-
+        self.loop_enabled: dict[int, bool] = {}
         self._register_handlers()
 
     def get_queue(self, chat_id: int) -> MusicQueue:
@@ -48,7 +48,28 @@ class Call:
                 chat_id,
             )
 
-            await self._play_next(chat_id)
+            if self.loop_enabled.get(chat_id, False):
+                current = self.get_queue(chat_id).current()
+
+                if current is not None:
+                    logger.info(
+                        "Loop enabled in chat %s - replaying: %s",
+                        chat_id,
+                        current["title"],
+                    )
+
+                    try:
+                        await self._stream(chat_id, current)
+                    except Exception:
+                        logger.exception(
+                            "Failed to replay looped track in chat %s",
+                            chat_id,
+                        )
+                        await self.leave(chat_id)
+
+                    return
+
+    await self._play_next(chat_id)
 
     def _build_stream(self, url: str) -> MediaStream:
         return MediaStream(
@@ -144,10 +165,25 @@ class Call:
 
     async def resume(self, chat_id: int):
         await self.pytgcalls.resume(chat_id)
+    def is_loop_enabled(self, chat_id: int) -> bool:
+    return self.loop_enabled.get(chat_id, False)
+
+
+def toggle_loop(self, chat_id: int) -> bool:
+    enabled = not self.loop_enabled.get(chat_id, False)
+    self.loop_enabled[chat_id] = enabled
+
+    logger.info(
+        "Loop %s in chat %s",
+        "enabled" if enabled else "disabled",
+        chat_id,
+    )
+
+    return enabled
 
     async def leave(self, chat_id: int):
         self.queues.pop(chat_id, None)
-
+        self.loop_enabled.pop(chat_id, None)
         try:
             await self.pytgcalls.leave_call(chat_id)
 
