@@ -1,5 +1,10 @@
 from pyrogram import filters
 
+from pyrogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+
 from config import Config
 from core.call import call
 from core.clients import bot
@@ -55,6 +60,18 @@ async def play_cmd(client, message):
 
     kind = "video" if video else "audio"
     if state == "playing":
-        await status.edit_text(f"▶️ Now playing ({kind}): **{info['title']}**")
+       await status.edit_text(
+    f"▶️ Now playing ({kind}): **{info['title']}**",
+    reply_markup=InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🔁 Loop: OFF",
+                    callback_data="loop_toggle",
+                )
+            ]
+        ]
+    ),
+)
     else:
         await status.edit_text(f"➕ Queued ({kind}): **{info['title']}**")
