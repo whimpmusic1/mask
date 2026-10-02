@@ -21,68 +21,51 @@ def _require(name: str) -> str:
 def _write_cookies_file() -> str | None:
     path = os.environ.get("YTDLP_COOKIES_PATH", "/app/cookies.txt")
 
-    b64 = (
-        os.environ.get("YTDLP_COOKIES_B64_1", "").strip()
-        + os.environ.get("YTDLP_COOKIES_B64_2", "").strip()
-    )
+    b64_1 = os.environ.get("YTDLP_COOKIES_B64_1", "").strip()
+    b64_2 = os.environ.get("YTDLP_COOKIES_B64_2", "").strip()
+    b64 = b64_1 + b64_2
 
     if not b64:
         b64 = os.environ.get("YTDLP_COOKIES_B64", "").strip()
 
-    # No env cookies: use an existing file if one exists.
-    if not b64:
-        if os.path.exists(path):
-            log.info("Using existing yt-dlp cookies file at %s.", path)
-            return path
-        return None
+    if b64:
+        try:
+            raw = base64.b64decode(b64, validate=True)
 
-    try:
-        raw = base64.b64decode(b64, validate=True)
+            if not raw.strip():
+                raise ValueError("Decoded cookies file is empty")
 
-        if not raw.strip():
-            raise ValueError("Decoded cookies file is empty")
+            header = raw.splitlines()[0].decode(
+                "utf-8", errors="replace"
+            ).strip()
 
-        first_line = raw.splitlines()[0].decode(
-            "utf-8", errors="replace"
-        ).strip()
+            if header not in (
+                "# HTTP Cookie File",
+                "# Netscape HTTP Cookie File",
+            ):
+                raise ValueError(
+                    f"Invalid cookies.txt header: {header!r}"
+                )
 
-        if first_line not in (
-            "# HTTP Cookie File",
-            "# Netscape HTTP Cookie File",
-        ):
-            raise ValueError(
-                f"Invalid cookies.txt header: {first_line!r}"
+            with open(path, "wb") as f:
+                f.write(raw)
+
+            log.info(
+                "Fresh yt-dlp cookies seeded at %s (%d bytes).",
+                path,
+                len(raw),
             )
+            return path
 
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
+        except Exception:
+            log.exception("Failed to decode/validate YouTube cookies")
+            return None
 
-        # IMPORTANT:
-        # Always replace an existing file when Railway cookie variables
-        # are supplied. This prevents an old persistent cookies.txt from
-        # silently overriding the new cookies.
-        tmp_path = f"{path}.tmp"
-
-        with open(tmp_path, "wb") as f:
-            f.write(raw)
-            f.flush()
-            os.fsync(f.fileno())
-
-        os.replace(tmp_path, path)
-
-        log.info(
-            "yt-dlp cookies seeded from Railway variables: %s (%d bytes)",
-            path,
-            len(raw),
-        )
+    if os.path.exists(path):
+        log.info("Using existing yt-dlp cookies file at %s.", path)
         return path
 
-    except Exception:
-        log.exception(
-            "Failed to decode/validate YouTube cookies"
-        )
-        return None
+    return None
 class Config:
     API_ID = int(_require("API_ID"))
     API_HASH = _require("API_HASH")
