@@ -62,7 +62,7 @@ def start_keyboard():
             [
                 InlineKeyboardButton(
                     "👑 Owner",
-                    url=f"tg://user?id={Config.OWNER_ID}",
+                     callback_data="show_owner",
                 )
             ]
         )
@@ -104,7 +104,7 @@ async def start_cmd(client, message):
             [
                 InlineKeyboardButton(
                     "👑 Owner",
-                    url=f"tg://user?id={Config.OWNER_ID}",
+                     callback_data="show_owner",
                 )
             ]
         )
@@ -170,7 +170,7 @@ async def back_button(client, callback_query):
             [
                 InlineKeyboardButton(
                     "👑 Owner",
-                    url=f"tg://user?id={Config.OWNER_ID}",
+                    callback_data="show_owner",
                 )
             ]
         )
@@ -180,7 +180,14 @@ async def back_button(client, callback_query):
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
+@bot.on_callback_query(filters.regex("^show_owner$"))
+async def show_owner(client, callback_query):
+    await callback_query.answer()
 
+    await callback_query.message.reply_text(
+        f'<a href="tg://user?id={Config.OWNER_ID}">👤 Contact Owner</a>',
+        parse_mode="html",
+    )
 @bot.on_message(filters.command("help"))
 async def help_cmd(client, message):
     await message.reply_text(HELP)
