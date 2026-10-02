@@ -1,77 +1,191 @@
-from pyrogram import filters
+import logging
 
-from pyrogram.types import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+import pyrogram.errors
 
-from config import Config
-from core.call import call
-from core.clients import bot
-from core.downloader import get_stream_info
-
-
-@bot.on_message(filters.command(["play", "vplay"]))
-async def play_cmd(client, message):
-    if len(message.command) < 2:
-        await message.reply_text(
-            "Give me something to play, e.g.\n`/play believer imagine dragons`"
+if not hasattr(pyrogram.errors, "GroupcallForbidden"):
+    if hasattr(pyrogram.errors, "GroupCallForbidden"):
+        pyrogram.errors.GroupcallForbidden = (
+            pyrogram.errors.GroupCallForbidden
         )
-        return
 
-    query = message.text.split(None, 1)[1].strip()
-    video = message.command[0] == "vplay"
-    chat_id = message.chat.id
+from pytgcalls import PyTgCalls
+from pytgcalls import filters as fl
+from pytgcalls.types import AudioQuality, MediaStream, StreamEnded
 
-    status = await message.reply_text("🔎 Searching...")
+from core.queue import MusicQueue
 
-    try:
-        info = await get_stream_info(query, video=video)
-    except Exception as e:
-        await status.edit_text(f"Couldn't find or resolve that: `{e}`")
-        return
 
-    duration_min = (info["duration"] or 0) / 60
-    if duration_min > Config.DURATION_LIMIT_MIN:
-        await status.edit_text(
-            f"That's {duration_min:.0f} min long, which is over the "
-            f"{Config.DURATION_LIMIT_MIN} min limit set in .env. Pick something shorter."
+logger = logging.getLogger(__name__)
+
+
+class Call:
+    def __init__(self, assistant_client):
+        self.pytgcalls = PyTgCalls(assistant_client)
+
+        self.queues: dict[int, MusicQueue] = {}
+
+        # Loop state for each group.
+        self.loop_enabled: dict[int, bool] = {}
+
+        self._register_handlers()
+
+    def get_queue(self, chat_id: int) -> MusicQueue:
+        if chat_id not in self.queues:
+            self.queues[chat_id] = MusicQueue()
+
+        return self.queues[chat_id]
+
+    def _register_handlers(self):
+        @self.pytgcalls.on_update(fl.stream_end())
+        async def _on_stream_end(client, update: StreamEnded):
+            chat_id = update.chat_id
+
+            logger.info(
+                "Stream ended in chat %s",
+                chat_id,
+            )
+
+            # If loop is enabled, replay the current track.
+            if self.loop_enabled.get(chat_id, False):
+                current = self.get_queue(chat_id).current()
+
+                if current is not None:
+                    logger.info(
+                        "Loop enabled in chat %s - replaying: %s",
+                        chat_id,
+                        current["title"],
+                    )
+
+                    try:
+                        await self._stream(chat_id, current)
+                    except Exception:
+                        logger.exception(
+                            "Failed to replay looped track in chat %s",
+                            chat_id,
+                        )
+                        await self.leave(chat_id)
+
+                    return
+
+            # Normal behavior: move to the next track.
+            await self._play_next(chat_id)
+
+    def _build_stream(self, url: str) -> MediaStream:
+        return MediaStream(
+            url,
+            audio_parameters=AudioQuality.HIGH,
+            video_flags=MediaStream.Flags.IGNORE,
         )
-        return
 
-    track = {
-        "url": info["url"],
-        "title": info["title"],
-        "duration": info["duration"],
-        "video": video,
-        "requested_by": message.from_user.mention if message.from_user else "someone",
-    }
+    async def _stream(self, chat_id: int, track: dict):
+        stream = self._build_stream(track["url"])
 
-    try:
-        state = await call.add_and_play(chat_id, track)
-    except Exception as e:
-        await status.edit_text(
-            "Couldn't join the voice chat. Double-check that:\n"
-            "1. A voice chat is currently active in this group\n"
-            "2. The *assistant* account (not just the bot) is a member here\n\n"
-            f"Error: `{e}`"
+        try:
+            await self.pytgcalls.play(chat_id, stream)
+
+            logger.info(
+                "Started audio stream in chat %s: %s",
+                chat_id,
+                track["title"],
+            )
+
+        except Exception:
+            logger.exception(
+                "Failed to start stream in chat %s: %s",
+                chat_id,
+                track["title"],
+            )
+            raise
+
+    async def _play_next(self, chat_id: int):
+        queue = self.get_queue(chat_id)
+
+        next_track = queue.advance()
+
+        if next_track is None:
+            await self.leave(chat_id)
+            return
+
+        try:
+            await self._stream(chat_id, next_track)
+
+        except Exception:
+            logger.exception(
+                "Failed to play next track in chat %s",
+                chat_id,
+            )
+            await self.leave(chat_id)
+
+    async def add_and_play(self, chat_id: int, track: dict) -> str:
+        queue = self.get_queue(chat_id)
+
+        was_empty = queue.current() is None
+
+        queue.add(track)
+
+        if was_empty:
+            try:
+                await self._stream(chat_id, track)
+
+            except Exception:
+                queue.clear()
+                raise
+
+            return "playing"
+
+        return "queued"
+
+    async def skip(self, chat_id: int):
+        await self._play_next(chat_id)
+
+    async def pause(self, chat_id: int):
+        await self.pytgcalls.pause(chat_id)
+
+    async def resume(self, chat_id: int):
+        await self.pytgcalls.resume(chat_id)
+
+    def is_loop_enabled(self, chat_id: int) -> bool:
+        return self.loop_enabled.get(chat_id, False)
+
+    def toggle_loop(self, chat_id: int) -> bool:
+        enabled = not self.loop_enabled.get(chat_id, False)
+
+        self.loop_enabled[chat_id] = enabled
+
+        logger.info(
+            "Loop %s in chat %s",
+            "enabled" if enabled else "disabled",
+            chat_id,
         )
-        return
 
-    kind = "video" if video else "audio"
-    if state == "playing":
-       await status.edit_text(
-    f"▶️ Now playing ({kind}): **{info['title']}**",
-    reply_markup=InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "🔁 Loop: OFF",
-                    callback_data="loop_toggle",
-                )
-            ]
-        ]
-    ),
-)
-    else:
-        await status.edit_text(f"➕ Queued ({kind}): **{info['title']}**")
+        return enabled
+
+    async def leave(self, chat_id: int):
+        self.queues.pop(chat_id, None)
+
+        # Remove loop state when leaving the voice chat.
+        self.loop_enabled.pop(chat_id, None)
+
+        try:
+            await self.pytgcalls.leave_call(chat_id)
+
+        except Exception as e:
+            logger.debug(
+                "leave_call for %s failed (probably already left): %s",
+                chat_id,
+                e,
+            )
+
+
+call = None
+
+
+def create_call(assistant_client):
+    global call
+
+    if call is not None:
+        return call
+
+    call = Call(assistant_client)
+
+    return call
