@@ -42,15 +42,16 @@ _COMMON_OPTS = {
     "fragment_retries": 3,
 }
 
-# If YTDLP_COOKIES_B64 was set, config.py already decoded it to a file on
-# disk - point yt-dlp at it so requests look like a real logged-in session.
+# If a YTDLP_COOKIES_B64 variable (single or split form) was set,
+# config.py already decoded it to a file on disk - point yt-dlp at it so
+# requests use the supplied logged-in session.
 # This is the reliable fix for YouTube's "Sign in to confirm you're not a
 # bot" wall once player-client swapping alone stops working (see README).
 if Config.YTDLP_COOKIES_FILE:
     _COMMON_OPTS["cookiefile"] = Config.YTDLP_COOKIES_FILE
 else:
     logger.warning(
-        "No YTDLP_COOKIES_B64 set - YouTube extraction may hit "
+        "No YouTube cookies configured - extraction may hit "
         "'Sign in to confirm you're not a bot' errors, especially from a "
         "datacenter IP like Railway's. See README for how to add cookies."
     )

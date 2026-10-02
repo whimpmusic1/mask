@@ -37,10 +37,12 @@ def start_keyboard(username: str = ""):
         InlineKeyboardButton("Group", url=Config.SUPPORT_URL),
     ])
     if Config.OWNER_ID:
-        # A Telegram user-ID deep link must be attached to an inline button.
-        # Putting tg://user?id=... in plain message text does not work.
+        # Use Telegram's native user-profile button instead of a tg:// URL.
+        # PyrogramMod 2.4.1 maps user_id to keyboardButtonUserProfile,
+        # which opens the owner's profile directly without the external-link
+        # confirmation dialog shown by tg:// URL buttons.
         buttons.append([InlineKeyboardButton(
-            "👑 Owner", url=f"tg://user?id={Config.OWNER_ID}"
+            "👑 Owner", user_id=Config.OWNER_ID
         )])
     return InlineKeyboardMarkup(buttons)
 

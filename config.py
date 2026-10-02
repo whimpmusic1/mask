@@ -36,14 +36,16 @@ def _write_cookies_file() -> str | None:
         log.info("Using existing yt-dlp cookies file at %s (not reseeding).", path)
         return path
 
-    # Railway/env vars are documented as a single YTDLP_COOKIES_B64 value,
-    # but allow split chunks as well for providers with variable-length limits.
-    b64 = os.environ.get("YTDLP_COOKIES_B64", "")
-    if not b64:
-        b64 = (
+    # Accept the documented single variable as well as the split form used
+    # by the original Railway setup. This preserves the working deployment
+    # while avoiding a silent failure when the README-style variable is used.
+    b64 = (
+        os.environ.get("YTDLP_COOKIES_B64", "").strip()
+        or (
             os.environ.get("YTDLP_COOKIES_B64_1", "")
             + os.environ.get("YTDLP_COOKIES_B64_2", "")
-        )
+        ).strip()
+    )
     if not b64:
         return None
 

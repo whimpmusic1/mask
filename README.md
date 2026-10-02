@@ -106,6 +106,8 @@ aren't enough on their own anymore. The fix that still reliably works is
    certutil -encode cookies.txt cookies.b64   # Windows (strip header/footer lines)
    ```
 5. In Railway's **Variables** tab, add `YTDLP_COOKIES_B64` with that string.
+   The bot also accepts the existing split form `YTDLP_COOKIES_B64_1` +
+   `YTDLP_COOKIES_B64_2` for compatibility with the original deployment.
 6. Redeploy. `config.py` decodes it to `/app/cookies.txt` at startup, and
    `core/downloader.py` automatically passes it to yt-dlp as `cookiefile`.
    You'll see `yt-dlp cookies file written to /app/cookies.txt` in the logs
