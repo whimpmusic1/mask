@@ -36,7 +36,10 @@ def _write_cookies_file() -> str | None:
         log.info("Using existing yt-dlp cookies file at %s (not reseeding).", path)
         return path
 
-    b64 = os.environ.get("YTDLP_COOKIES_B64")
+    b64 = (
+    os.environ.get("YTDLP_COOKIES_B64_1", "")
+    + os.environ.get("YTDLP_COOKIES_B64_2", "")
+)
     if not b64:
         return None
 
