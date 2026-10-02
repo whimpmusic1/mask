@@ -79,6 +79,9 @@ class Config:
     # The first owner is the one displayed by the Owner button.
     # All IDs in OWNER_IDS have owner permissions.
     OWNER_ID = OWNER_IDS[0] if OWNER_IDS else 0
+    # Optional public Telegram username used for the Owner profile button.
+    # When omitted, start.py attempts to resolve the username from OWNER_ID.
+    OWNER_USERNAME = os.environ.get("OWNER_USERNAME", "").strip().lstrip("@")
     UPDATES_URL = os.environ.get("UPDATES_URL", "https://t.me/psycho_dv")
     SUPPORT_URL = os.environ.get("SUPPORT_URL", "https://t.me/+pra5-89rnZoxYzQ1")
     # Safety cap so nobody accidentally streams a 4-hour video forever.

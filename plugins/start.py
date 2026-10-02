@@ -27,7 +27,7 @@ HELP = (
 )
 
 
-def start_keyboard(username: str = ""):
+def start_keyboard(username: str = "", owner_username: str = ""):
     buttons = [[InlineKeyboardButton(
         "ADD ME TO YOUR GROUP", url=f"https://t.me/{username}?startgroup=true"
     )]] if username else []
@@ -37,20 +37,45 @@ def start_keyboard(username: str = ""):
         InlineKeyboardButton("Group", url=Config.SUPPORT_URL),
     ])
     if Config.OWNER_ID:
-        # Use Telegram's native user-profile button instead of a tg:// URL.
-        # PyrogramMod 2.4.1 maps user_id to keyboardButtonUserProfile,
-        # which opens the owner's profile directly without the external-link
-        # confirmation dialog shown by tg:// URL buttons.
-        buttons.append([InlineKeyboardButton(
-            "👑 Owner", user_id=Config.OWNER_ID
-        )])
+        # Do not use InlineKeyboardButton(user_id=...). The installed
+        # Pyrogram/PyrogramMod stack in Railway raises a constructor error
+        # while serializing that field (InputKeyboardButtonUserProfile).
+        # A public username is the compatible Telegram profile-link form.
+        owner_username = (owner_username or Config.OWNER_USERNAME).strip().lstrip("@")
+        if owner_username:
+            buttons.append([InlineKeyboardButton(
+                "👑 Owner", url=f"https://t.me/{owner_username}?profile"
+            )])
+        else:
+            # This fallback keeps /start functional for private accounts that
+            # have no username. The ID link is supported by Telegram inside an
+            # inline keyboard, although clients may show an Open Link prompt.
+            buttons.append([InlineKeyboardButton(
+                "👑 Owner", url=f"tg://user?id={Config.OWNER_ID}"
+            )])
     return InlineKeyboardMarkup(buttons)
+
+
+async def _resolve_owner_username(client) -> str:
+    if Config.OWNER_USERNAME:
+        return Config.OWNER_USERNAME
+    if not Config.OWNER_ID:
+        return ""
+    try:
+        owner = await client.get_users(Config.OWNER_ID)
+        return (owner.username or "").strip().lstrip("@")
+    except Exception:
+        return ""
 
 
 @bot.on_message(filters.command("start"))
 async def start_cmd(client, message):
     me = await client.get_me()
-    await message.reply_text(WELCOME, reply_markup=start_keyboard(me.username or ""))
+    owner_username = await _resolve_owner_username(client)
+    await message.reply_text(
+        WELCOME,
+        reply_markup=start_keyboard(me.username or "", owner_username),
+    )
 
 
 @bot.on_callback_query(filters.regex("^start_help$"))
@@ -65,7 +90,11 @@ async def help_button(client, callback_query):
 async def back_button(client, callback_query):
     await callback_query.answer()
     me = await client.get_me()
-    await callback_query.message.edit_text(WELCOME, reply_markup=start_keyboard(me.username or ""))
+    owner_username = await _resolve_owner_username(client)
+    await callback_query.message.edit_text(
+        WELCOME,
+        reply_markup=start_keyboard(me.username or "", owner_username),
+    )
 
 
 @bot.on_message(filters.command("help"))

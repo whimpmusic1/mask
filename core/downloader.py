@@ -17,44 +17,89 @@ _COMMON_OPTS = {
     "nocheckcertificate": True,
     "skip_download": True,
 
-    # Use Node for YouTube JavaScript challenges (nsig decryption etc).
-    # Requires Node.js to actually be installed in the image - see Dockerfile.
-    "js_runtimes": {
-        "node": {},
-    },
-
-    # Keep EJS available for current YouTube extraction.
-    "remote_components": {
-        "ejs": ["github"],
-    },
+    # Use Node for current YouTube JavaScript challenges.
+    "js_runtimes": {"node": {}},
+    "remote_components": {"ejs": ["github"]},
 
     "extractor_args": {
         "youtube": {
+            # Keep the original mweb+PO-token path first; it is the path
+            # used by the working deployment. We retry with alternate
+            # clients only when YouTube returns an authentication/bot error.
             "player_client": ["mweb"],
         },
         "youtubepot-bgutilhttp": {
             "base_url": "http://127.0.0.1:4416",
         },
     },
-
-    # Retry transient YouTube failures.
     "retries": 3,
     "fragment_retries": 3,
 }
 
-# If a YTDLP_COOKIES_B64 variable (single or split form) was set,
-# config.py already decoded it to a file on disk - point yt-dlp at it so
-# requests use the supplied logged-in session.
-# This is the reliable fix for YouTube's "Sign in to confirm you're not a
-# bot" wall once player-client swapping alone stops working (see README).
 if Config.YTDLP_COOKIES_FILE:
     _COMMON_OPTS["cookiefile"] = Config.YTDLP_COOKIES_FILE
+    try:
+        size = __import__("os").path.getsize(Config.YTDLP_COOKIES_FILE)
+        logger.info("yt-dlp cookie file ready: %s (%d bytes)", Config.YTDLP_COOKIES_FILE, size)
+    except OSError:
+        logger.warning("yt-dlp cookie file path exists in config but could not be stat'ed: %s", Config.YTDLP_COOKIES_FILE)
 else:
     logger.warning(
         "No YouTube cookies configured - extraction may hit "
         "'Sign in to confirm you're not a bot' errors, especially from a "
-        "datacenter IP like Railway's. See README for how to add cookies."
+        "datacenter IP like Railway's."
     )
+
+
+def _is_youtube_auth_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return (
+        "sign in to confirm you’re not a bot" in text
+        or "sign in to confirm you're not a bot" in text
+        or "use --cookies-from-browser or --cookies" in text
+        or "confirm you're not a bot" in text
+    )
+
+
+def _extract_with_opts(query: str, video: bool, opts: dict) -> dict:
+    logger.info("yt-dlp extracting: %s (player clients=%s)", query, opts.get("extractor_args", {}).get("youtube", {}).get("player_client"))
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(query, download=False)
+        if info.get("entries"):
+            info = next((entry for entry in info["entries"] if entry), None)
+        if not info:
+            raise RuntimeError("yt-dlp returned no result for the requested media.")
+        return info
+
+
+def _extract(query: str, video: bool) -> dict:
+    opts = _VIDEO_OPTS if video else _AUDIO_OPTS
+    try:
+        return _extract_with_opts(query, video, opts)
+    except Exception as exc:
+        if not _is_youtube_auth_error(exc):
+            raise
+        logger.warning("YouTube rejected the first client with an authentication/bot check; retrying with alternate clients.")
+
+        # Retry without changing the cookie file or PO-token provider.
+        # This handles sessions where YouTube rejects one player client but
+        # accepts another with the same authenticated cookie jar.
+        for client in ("web", "default"):
+            retry_opts = dict(opts)
+            retry_opts["extractor_args"] = {
+                **opts.get("extractor_args", {}),
+                "youtube": {
+                    **opts.get("extractor_args", {}).get("youtube", {}),
+                    "player_client": [client],
+                },
+            }
+            try:
+                return _extract_with_opts(query, video, retry_opts)
+            except Exception as retry_exc:
+                if not _is_youtube_auth_error(retry_exc):
+                    raise
+                logger.warning("YouTube rejected player client %s as well.", client)
+        raise
 
 
 _AUDIO_OPTS = {
@@ -67,32 +112,6 @@ _VIDEO_OPTS = {
     **_COMMON_OPTS,
     "format": "best[height<=480][ext=mp4]/best[height<=480]/best",
 }
-
-
-def _extract(query: str, video: bool) -> dict:
-    opts = _VIDEO_OPTS if video else _AUDIO_OPTS
-
-    logger.info("yt-dlp extracting: %s", query)
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(query, download=False)
-
-        if info.get("entries"):
-            info = next(
-                (
-                    entry
-                    for entry in info["entries"]
-                    if entry
-                ),
-                None,
-            )
-
-        if not info:
-            raise RuntimeError(
-                "yt-dlp returned no result for the requested media."
-            )
-
-        return info
 
 
 async def get_stream_info(query: str, video: bool = False) -> dict:
