@@ -6,7 +6,6 @@ import pkgutil
 import plugins
 
 from core import call as call_module
-from core import cookie_refresher
 from core.clients import assistant, bot
 
 
@@ -48,11 +47,6 @@ async def main():
 
     # Load plugins only after the global `call` object exists.
     load_plugins()
-
-    # Background task: periodically keeps the yt-dlp cookie session warm
-    # so it doesn't go stale from pure inactivity between manual re-exports.
-    # See core/cookie_refresher.py for exactly what this can and can't do.
-    asyncio.create_task(cookie_refresher.run_forever())
 
     logging.info(
         "Music bot is live - audio-only voice-chat streaming ready."
