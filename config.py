@@ -61,10 +61,6 @@ def _write_cookies_file() -> str | None:
             log.exception("Failed to decode/validate YouTube cookies")
             return None
 
-    if os.path.exists(path):
-        log.info("Using existing yt-dlp cookies file at %s.", path)
-        return path
-
     return None
 class Config:
     API_ID = int(_require("API_ID"))
