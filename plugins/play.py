@@ -6,7 +6,7 @@ from core.clients import bot
 from core.downloader import get_stream_info
 
 
-@bot.on_message(filters.command(["play", "vplay"]))
+@bot.on_message(filters.command(["play", "vplay"]) & filters.group)
 async def play_cmd(client, message):
     if len(message.command) < 2:
         await message.reply_text(
