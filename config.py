@@ -36,10 +36,14 @@ def _write_cookies_file() -> str | None:
         log.info("Using existing yt-dlp cookies file at %s (not reseeding).", path)
         return path
 
-    b64 = (
-    os.environ.get("YTDLP_COOKIES_B64_1", "")
-    + os.environ.get("YTDLP_COOKIES_B64_2", "")
-)
+    # Railway/env vars are documented as a single YTDLP_COOKIES_B64 value,
+    # but allow split chunks as well for providers with variable-length limits.
+    b64 = os.environ.get("YTDLP_COOKIES_B64", "")
+    if not b64:
+        b64 = (
+            os.environ.get("YTDLP_COOKIES_B64_1", "")
+            + os.environ.get("YTDLP_COOKIES_B64_2", "")
+        )
     if not b64:
         return None
 
@@ -59,15 +63,22 @@ class Config:
     BOT_TOKEN = _require("BOT_TOKEN")
     SESSION_STRING = _require("SESSION_STRING")
 
-    OWNER_IDS = tuple(
+    # Accept both the current plural list and legacy singular Railway variable.
+    _owner_values = ",".join(filter(None, (
+        os.environ.get("OWNER_IDS", "").strip(),
+        os.environ.get("OWNER_ID", "").strip(),
+    )))
+    OWNER_IDS = tuple(dict.fromkeys(
         int(owner_id.strip())
-        for owner_id in os.environ.get("OWNER_IDS", "").split(",")
+        for owner_id in _owner_values.split(",")
         if owner_id.strip()
-    )
+    ))
 
     # The first owner is the one displayed by the Owner button.
     # All IDs in OWNER_IDS have owner permissions.
     OWNER_ID = OWNER_IDS[0] if OWNER_IDS else 0
+    UPDATES_URL = os.environ.get("UPDATES_URL", "https://t.me/psycho_dv")
+    SUPPORT_URL = os.environ.get("SUPPORT_URL", "https://t.me/+pra5-89rnZoxYzQ1")
     # Safety cap so nobody accidentally streams a 4-hour video forever.
     DURATION_LIMIT_MIN = int(os.environ.get("DURATION_LIMIT_MIN", "60"))
     # Default video quality piped into the voice chat.
