@@ -4,7 +4,7 @@ from config import Config
 import core.call as call_module
 from core.clients import bot
 from core.downloader import get_stream_info
-from plugins.controls import player_keyboard
+from plugins.controls import player_keyboard, remember_player_message, _format_now_playing
 
 
 @bot.on_message(filters.command(["play", "vplay"]) & filters.group)
