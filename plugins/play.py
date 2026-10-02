@@ -6,8 +6,18 @@ from core.clients import bot
 from core.downloader import get_stream_info
 
 
-@bot.on_message(filters.command(["play", "vplay"]) & filters.group)
+@bot.on_message(filters.command(["play", "vplay"]))
 async def play_cmd(client, message):
+
+    # /play is allowed only in groups.
+    if message.chat.type not in ("group", "supergroup"):
+        await message.reply_text(
+            "❌ **This command can only be used in a group.**\n\n"
+            "Add me to your group, start a voice chat, and use:\n"
+            "`/play <song name or link>`"
+        )
+        return
+
     if len(message.command) < 2:
         await message.reply_text(
             "Give me something to play, e.g.\n"
@@ -66,7 +76,7 @@ async def play_cmd(client, message):
         await status.edit_text(
             "Couldn't join the voice chat. Double-check that:\n"
             "1. A voice chat is currently active in this group\n"
-            "2. The *assistant* account (not just the bot) is a member here\n\n"
+            "2. The assistant account is a member of this group\n\n"
             f"Error: `{e}`"
         )
         return
@@ -77,7 +87,6 @@ async def play_cmd(client, message):
         await status.edit_text(
             f"▶️ Now playing ({kind}): **{info['title']}**"
         )
-
     else:
         await status.edit_text(
             f"➕ Queued ({kind}): **{info['title']}**"
