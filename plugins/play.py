@@ -8,7 +8,6 @@ from core.downloader import get_stream_info
 @bot.on_message(filters.command(["play", "vplay"]))
 async def play_cmd(client, message):
 
-
 # /play is allowed only in groups.
 if message.chat.type not in ("group", "supergroup"):
     await message.reply_text(
