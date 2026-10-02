@@ -1,9 +1,98 @@
 from pyrogram import filters
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 
 import core.call as call_module
 from core.clients import bot
+PLAYER_MESSAGES: dict[int, int] = {}
 
+def remember_player_message(chat_id: int, message_id: int) -> None:
+    PLAYER_MESSAGES[chat_id] = message_id
+    
+def _format_now_playing(track: dict) -> str:
+    kind = "video" if track.get("video") else "audio"
+    duration = int(track.get("duration") or 0)
+    mins, secs = divmod(duration, 60)
+
+    return (
+        f"🎶 **Now playing ({kind})**\n\n"
+        f"**{track.get('title', 'Unknown track')}**\n"
+        f"⏱ {mins}:{secs:02d}\n"
+        f"👤 Requested by {track.get('requested_by', 'someone')}"
+    )
+async def _update_now_playing_message(chat_id: int, track):
+    message_id = PLAYER_MESSAGES.get(chat_id)
+
+    if not track:
+        if message_id:
+            try:
+                await bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    caption="⏹ **Playback finished**\n\nThe queue is empty.",
+                    reply_markup=None,
+                )
+            except Exception:
+                try:
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text="⏹ **Playback finished**\n\nThe queue is empty.",
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+
+        PLAYER_MESSAGES.pop(chat_id, None)
+        return
+
+    caption = _format_now_playing(track)
+    thumbnail = track.get("thumbnail")
+
+    # No existing player message.
+    if message_id is None:
+        if thumbnail:
+            msg = await bot.send_photo(
+                chat_id=chat_id,
+                photo=thumbnail,
+                caption=caption,
+                reply_markup=player_keyboard(chat_id),
+            )
+        else:
+            msg = await bot.send_message(
+                chat_id=chat_id,
+                text=caption,
+                reply_markup=player_keyboard(chat_id),
+            )
+
+        PLAYER_MESSAGES[chat_id] = msg.id
+        return
+
+    # Existing player message is a photo.
+    if thumbnail:
+        try:
+            await bot.edit_message_media(
+                chat_id=chat_id,
+                message_id=message_id,
+                media=InputMediaPhoto(
+                    media=thumbnail,
+                    caption=caption,
+                ),
+                reply_markup=player_keyboard(chat_id),
+            )
+            return
+        except Exception:
+            pass
+
+    # Fallback if the old message was text.
+    try:
+        await bot.edit_message_caption(
+            chat_id=chat_id,
+            message_id=message_id,
+            caption=caption,
+            reply_markup=player_keyboard(chat_id),
+        )
+    except Exception:
+        pass
 
 def player_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     looping = call_module.call.get_loop_remaining(chat_id) > 0
