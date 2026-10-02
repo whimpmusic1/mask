@@ -49,6 +49,7 @@ async def play_cmd(client, message):
         "url": info["url"],
         "title": info["title"],
         "duration": info.get("duration") or 0,
+        "thumbnail": info.get("thumbnail"),
         "video": video,
         "requested_by": (
             message.from_user.mention
