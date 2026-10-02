@@ -31,10 +31,7 @@ def _write_cookies_file() -> str | None:
     accumulated refresh away for no reason.
     """
     path = os.environ.get("YTDLP_COOKIES_PATH", "/app/cookies.txt")
-
-    if os.path.exists(path):
-        log.info("Using existing yt-dlp cookies file at %s (not reseeding).", path)
-        return path
+     
 
     # Accept the documented single variable as well as the split form used
     # by the original Railway setup. This preserves the working deployment
