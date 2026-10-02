@@ -166,20 +166,20 @@ class Call:
     async def resume(self, chat_id: int):
         await self.pytgcalls.resume(chat_id)
     def is_loop_enabled(self, chat_id: int) -> bool:
-    return self.loop_enabled.get(chat_id, False)
+        return self.loop_enabled.get(chat_id, False)
 
 
-def toggle_loop(self, chat_id: int) -> bool:
-    enabled = not self.loop_enabled.get(chat_id, False)
-    self.loop_enabled[chat_id] = enabled
+    def toggle_loop(self, chat_id: int) -> bool:
+        enabled = not self.loop_enabled.get(chat_id, False)
+        self.loop_enabled[chat_id] = enabled
 
-    logger.info(
-        "Loop %s in chat %s",
-        "enabled" if enabled else "disabled",
-        chat_id,
-    )
-
-    return enabled
+        logger.info(
+            "Loop %s in chat %s",
+            "enabled" if enabled else "disabled",
+            chat_id,
+        )
+    
+        return enabled
 
     async def leave(self, chat_id: int):
         self.queues.pop(chat_id, None)
