@@ -59,7 +59,15 @@ class Config:
     BOT_TOKEN = _require("BOT_TOKEN")
     SESSION_STRING = _require("SESSION_STRING")
 
-    OWNER_ID = int(os.environ.get("OWNER_ID", "0"))
+    OWNER_IDS = tuple(
+        int(owner_id.strip())
+        for owner_id in os.environ.get("OWNER_IDS", "").split(",")
+        if owner_id.strip()
+    )
+
+    # The first owner is the one displayed by the Owner button.
+    # All IDs in OWNER_IDS have owner permissions.
+    OWNER_ID = OWNER_IDS[0] if OWNER_IDS else 0
     # Safety cap so nobody accidentally streams a 4-hour video forever.
     DURATION_LIMIT_MIN = int(os.environ.get("DURATION_LIMIT_MIN", "60"))
     # Default video quality piped into the voice chat.
