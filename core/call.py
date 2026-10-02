@@ -24,12 +24,16 @@ class Call:
 
     def __init__(self, assistant_client):
         # IMPORTANT:
-        # This must be created inside the same asyncio event loop
-        # in which the application is running.
+        # Create this inside the running asyncio event loop.
         self.pytgcalls = PyTgCalls(assistant_client)
 
         self.queues: dict[int, MusicQueue] = {}
-        self.loop_enabled: dict[int, bool] = {}
+
+        # Number of additional times the current song should repeat.
+        # Example:
+        # /loop 5 -> current song repeats 5 additional times.
+        self.loop_remaining: dict[int, int] = {}
+
         self._register_handlers()
 
     def get_queue(self, chat_id: int) -> MusicQueue:
@@ -48,28 +52,41 @@ class Call:
                 chat_id,
             )
 
-            if self.loop_enabled.get(chat_id, False):
-                current = self.get_queue(chat_id).current()
+            # Repeat the current track if loop count is active.
+            remaining = self.loop_remaining.get(chat_id, 0)
+
+            if remaining > 0:
+                queue = self.get_queue(chat_id)
+                current = queue.current()
 
                 if current is not None:
+                    self.loop_remaining[chat_id] = remaining - 1
+
                     logger.info(
-                        "Loop enabled in chat %s - replaying: %s",
+                        "Looping current track in chat %s. "
+                        "Remaining repeats: %s",
                         chat_id,
-                        current["title"],
+                        remaining - 1,
                     )
 
                     try:
-                        await self._stream(chat_id, current)
+                        await self._stream(
+                            chat_id,
+                            current,
+                        )
                     except Exception:
                         logger.exception(
-                            "Failed to replay looped track in chat %s",
+                            "Failed to loop current track in chat %s",
                             chat_id,
                         )
                         await self.leave(chat_id)
 
                     return
 
-    await self._play_next(chat_id)
+            # Normal queue behaviour.
+            self.loop_remaining.pop(chat_id, None)
+
+            await self._play_next(chat_id)
 
     def _build_stream(self, url: str) -> MediaStream:
         return MediaStream(
@@ -158,6 +175,8 @@ class Call:
         return "queued"
 
     async def skip(self, chat_id: int):
+        # Skipping cancels the current loop.
+        self.loop_remaining.pop(chat_id, None)
         await self._play_next(chat_id)
 
     async def pause(self, chat_id: int):
@@ -165,25 +184,31 @@ class Call:
 
     async def resume(self, chat_id: int):
         await self.pytgcalls.resume(chat_id)
-    def is_loop_enabled(self, chat_id: int) -> bool:
-        return self.loop_enabled.get(chat_id, False)
 
-
-    def toggle_loop(self, chat_id: int) -> bool:
-        enabled = not self.loop_enabled.get(chat_id, False)
-        self.loop_enabled[chat_id] = enabled
+    def set_loop(self, chat_id: int, count: int):
+        self.loop_remaining[chat_id] = count
 
         logger.info(
-            "Loop %s in chat %s",
-            "enabled" if enabled else "disabled",
+            "Loop set to %s additional repeats in chat %s",
+            count,
             chat_id,
         )
-    
-        return enabled
+
+    def get_loop_remaining(self, chat_id: int) -> int:
+        return self.loop_remaining.get(chat_id, 0)
+
+    def disable_loop(self, chat_id: int):
+        self.loop_remaining.pop(chat_id, None)
+
+        logger.info(
+            "Loop disabled in chat %s",
+            chat_id,
+        )
 
     async def leave(self, chat_id: int):
         self.queues.pop(chat_id, None)
-        self.loop_enabled.pop(chat_id, None)
+        self.loop_remaining.pop(chat_id, None)
+
         try:
             await self.pytgcalls.leave_call(chat_id)
 
@@ -196,22 +221,15 @@ class Call:
 
 
 # IMPORTANT:
-# DO NOT create:
-#
-# call = Call(assistant)
-#
-# here.
-#
-# It must be created from inside bot.py's asyncio event loop.
+# Do not create Call(assistant) here.
+# It must be created inside bot.py's running asyncio event loop.
 call = None
 
 
 def create_call(assistant_client):
     """
-    Create the PyTgCalls instance.
-
-    This function is intentionally called from inside the
-    application's running asyncio event loop.
+    Create the PyTgCalls instance from inside
+    the application's running asyncio event loop.
     """
     global call
 
