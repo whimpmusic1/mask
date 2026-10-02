@@ -6,16 +6,8 @@ from core.clients import bot
 from core.downloader import get_stream_info
 
 
-@bot.on_message(filters.command(["play", "vplay"]))
+@bot.on_message(filters.command(["play", "vplay"]) & filters.group)
 async def play_cmd(client, message):
-
-    if message.chat.type not in ("group", "supergroup"):
-        await message.reply_text(
-            "❌ This command can only be used in a group.\n\n"
-            "Add me to your group, start a voice chat, and use:\n"
-            "/play <song name or link>"
-        )
-        return
 
     if len(message.command) < 2:
         await message.reply_text(
