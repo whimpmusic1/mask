@@ -21,7 +21,7 @@ async def play_cmd(client, message):
     if len(message.command) < 2:
         await message.reply_text(
             "Give me something to play, e.g.\n"
-            "`/play believer imagine dragons`"
+            "`/play chandni `"
         )
         return
 
