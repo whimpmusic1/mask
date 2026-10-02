@@ -1,0 +1,13 @@
+# Telegram voice/video calls + Pyrogram integration
+py-tgcalls==2.3.3
+pyrogrammod==2.4.1
+tgcrypto==1.2.5
+
+# Media resolver
+# Keep yt-dlp reasonably current because extractor changes frequently.
+yt-dlp[default]>=2026.1.0
+
+bgutil-ytdlp-pot-provider==2.0.0
+
+# Configuration
+python-dotenv==1.0.1
