@@ -75,13 +75,29 @@ async def play_cmd(client, message):
     kind = "video" if video else "audio"
 
     if state == "playing":
-        await status.edit_text(
-            f"🎶 **Now playing ({kind})**\n\n**{info['title']}**\n"
-            f"⏱ {int(info.get('duration') or 0) // 60}:"
-            f"{int(info.get('duration') or 0) % 60:02d}\n"
-            f"👤 Requested by {track['requested_by']}",
-            reply_markup=player_keyboard(chat_id),
-        )
+        caption = _format_now_playing(track)
+        thumbnail = track.get("thumbnail")
+
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
+        if thumbnail:
+            player_message = await bot.send_photo(
+                chat_id=chat_id,
+                photo=thumbnail,
+                caption=caption,
+                reply_markup=player_keyboard(chat_id),
+            )
+        else:
+            player_message = await bot.send_message(
+                chat_id=chat_id,
+                text=caption,
+                reply_markup=player_keyboard(chat_id),
+            )
+
+        remember_player_message(chat_id, player_message.id)
     else:
         await status.edit_text(
             f"➕ Queued ({kind}): {info['title']}\n"
