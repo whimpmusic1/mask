@@ -118,7 +118,7 @@ class Call:
         await self._play_next(chat_id)
 
 
-    def _build_stream(self, url: str) -> MediaStream:
+    def _build_stream(self, track: dict) -> MediaStream:
         headers = track.get("http_headers") or {}
         
         return MediaStream(
