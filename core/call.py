@@ -8,9 +8,7 @@ import pyrogram.errors
 # Newer Pyrogram versions expose GroupCallForbidden instead.
 if not hasattr(pyrogram.errors, "GroupcallForbidden"):
     if hasattr(pyrogram.errors, "GroupCallForbidden"):
-        pyrogram.errors.GroupcallForbidden = (
-            pyrogram.errors.GroupCallForbidden
-        )
+        pyrogram.errors.GroupcallForbidden = pyrogram.errors.GroupCallForbidden
 
 from pytgcalls import PyTgCalls
 from pytgcalls import filters as fl
@@ -25,28 +23,16 @@ class Call:
     """PyTgCalls wrapper with a per-chat FIFO audio queue."""
 
     def __init__(self, assistant_client):
-        # IMPORTANT:
         # Create this inside the running asyncio event loop.
         self.pytgcalls = PyTgCalls(assistant_client)
-
         self.queues: dict[int, MusicQueue] = {}
-        # Delay teardown after the last track so an immediate /play can reuse
-        # the active Telegram voice-chat connection.
         self._leave_tasks: dict[int, asyncio.Task] = {}
         self._last_leave_at: dict[int, float] = {}
         self._leave_delay = 5.0
         self._join_cooldown = 1.5
-        # Serialize play/skip/end transitions per chat. A short suppression
-        # window prevents a replaced stream's delayed end event from skipping
-        # the newly-started track a second time.
         self._chat_locks: dict[int, asyncio.Lock] = {}
         self._manual_transition_at: dict[int, float] = {}
-
-        # Number of additional times the current song should repeat.
-        # Example:
-        # /loop 5 -> current song repeats 5 additional times.
         self.loop_remaining: dict[int, int] = {}
-
         self._register_handlers()
 
     def _chat_lock(self, chat_id: int) -> asyncio.Lock:
@@ -57,70 +43,58 @@ class Call:
     def get_queue(self, chat_id: int) -> MusicQueue:
         if chat_id not in self.queues:
             self.queues[chat_id] = MusicQueue()
-
         return self.queues[chat_id]
 
     def _register_handlers(self):
         @self.pytgcalls.on_update(fl.stream_end())
         async def _on_stream_end(client, update: StreamEnded):
             chat_id = update.chat_id
-
-            logger.info(
-                "Stream ended in chat %s",
-                chat_id,
-            )
+            logger.info("Stream-ended event received in chat %s", chat_id)
 
             async with self._chat_lock(chat_id):
-                # play() may emit the replaced stream's end event shortly after
-                # an explicit skip. Do not advance the queue twice.
                 changed_at = self._manual_transition_at.get(chat_id, 0.0)
-                if time.monotonic() - changed_at < 2.5:
-                    logger.info("Ignoring stale stream-end during transition in chat %s", chat_id)
+                elapsed = time.monotonic() - changed_at
+                if elapsed < 2.5:
+                    logger.info(
+                        "Ignoring possible stale stream-end event in chat %s "
+                        "(%.2fs after manual transition)",
+                        chat_id,
+                        elapsed,
+                    )
                     return
-
                 await self._handle_stream_end(chat_id)
 
     async def _handle_stream_end(self, chat_id: int):
-        # Repeat the current track if loop count is active.
+        queue = self.get_queue(chat_id)
+        current = queue.current()
+        logger.info(
+            "Handling stream end in chat %s; current=%r queue_size=%d",
+            chat_id,
+            current.get("title") if current else None,
+            len(queue.tracks),
+        )
+
         remaining = self.loop_remaining.get(chat_id, 0)
+        if remaining > 0 and current is not None:
+            self.loop_remaining[chat_id] = remaining - 1
+            logger.info(
+                "Looping current track in chat %s; repeats remaining=%d",
+                chat_id,
+                remaining - 1,
+            )
+            try:
+                await self._stream(chat_id, current)
+            except Exception:
+                logger.exception("Failed to loop current track in chat %s", chat_id)
+                await self._leave_locked(chat_id)
+            return
 
-        if remaining > 0:
-            queue = self.get_queue(chat_id)
-            current = queue.current()
-
-            if current is not None:
-                self.loop_remaining[chat_id] = remaining - 1
-
-                logger.info(
-                    "Looping current track in chat %s. "
-                    "Remaining repeats: %s",
-                    chat_id,
-                    remaining - 1,
-                )
-
-                try:
-                    await self._stream(
-                        chat_id,
-                        current,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed to loop current track in chat %s",
-                        chat_id,
-                    )
-                    await self._leave_locked(chat_id)
-
-                return
-
-        # Normal queue behaviour.
         self.loop_remaining.pop(chat_id, None)
-
         await self._play_next(chat_id)
 
-
     def _build_stream(self, track: dict) -> MediaStream:
+        """Build a PyTgCalls stream from the downloader's track dictionary."""
         headers = track.get("http_headers") or {}
-        
         return MediaStream(
             track["url"],
             audio_parameters=AudioQuality.HIGH,
@@ -141,47 +115,48 @@ class Call:
         if left_at is not None:
             remaining = self._join_cooldown - (time.monotonic() - left_at)
             if remaining > 0:
+                logger.info("Waiting %.2fs before rejoining chat %s", remaining, chat_id)
                 await asyncio.sleep(remaining)
             self._last_leave_at.pop(chat_id, None)
 
     async def _stream(self, chat_id: int, track: dict):
-        """Start an audio stream, reusing a call if teardown is pending."""
+        """Start a stream, reusing a call if teardown is pending."""
         self._cancel_pending_leave(chat_id)
         await self._wait_for_join_cooldown(chat_id)
-        stream = self._build_stream(track)
-
         logger.info(
-            "Starting stream in chat %s: title=%r, duration=%s, headers_present=%s",
+            "Building stream in chat %s: title=%r duration=%r url_present=%s headers_present=%s",
             chat_id,
             track.get("title"),
             track.get("duration"),
+            bool(track.get("url")),
             bool(track.get("http_headers")),
         )
-
+        stream = self._build_stream(track)
         try:
-            await self.pytgcalls.play(
-                chat_id,
-                stream,
-            )
-
+            await self.pytgcalls.play(chat_id, stream)
             logger.info(
-                "Started audio stream in chat %s: %s",
+                "PyTgCalls play() returned in chat %s for %r",
                 chat_id,
-                track["title"],
+                track.get("title"),
             )
-
         except Exception:
             logger.exception(
-                "Failed to start stream in chat %s: %s",
+                "PyTgCalls play() failed in chat %s for %r",
                 chat_id,
-                track["title"],
+                track.get("title"),
             )
             raise
 
     async def _play_next(self, chat_id: int):
         queue = self.get_queue(chat_id)
-
+        logger.info("Advancing queue in chat %s; size_before=%d", chat_id, len(queue.tracks))
         next_track = queue.advance()
+        logger.info(
+            "Queue advanced in chat %s; next=%r size_after=%d",
+            chat_id,
+            next_track.get("title") if next_track else None,
+            len(queue.tracks),
+        )
 
         if next_track is None:
             await self._update_player(chat_id, None)
@@ -189,27 +164,26 @@ class Call:
             return
 
         try:
-            await self._stream(
-                chat_id,
-                next_track,
-            )
+            await self._stream(chat_id, next_track)
             await self._update_player(chat_id, next_track)
-
         except Exception:
-            logger.exception(
-                "Failed to play next track in chat %s",
-                chat_id,
-            )
-
+            logger.exception("Failed to play next track in chat %s", chat_id)
             await self._leave_locked(chat_id)
 
     async def add_and_play(self, chat_id: int, track: dict) -> str:
-        """Add a track and start it if this chat's queue is idle."""
+        """Queue a track and start it if the queue is idle."""
         async with self._chat_lock(chat_id):
             self._cancel_pending_leave(chat_id)
             queue = self.get_queue(chat_id)
             was_empty = queue.current() is None
             queue.add(track)
+            logger.info(
+                "Track added in chat %s: title=%r was_empty=%s queue_size=%d",
+                chat_id,
+                track.get("title"),
+                was_empty,
+                len(queue.tracks),
+            )
             if was_empty:
                 try:
                     await self._stream(chat_id, track)
@@ -224,6 +198,7 @@ class Call:
         async with self._chat_lock(chat_id):
             self.loop_remaining.pop(chat_id, None)
             self._manual_transition_at[chat_id] = time.monotonic()
+            logger.info("Manual skip in chat %s", chat_id)
             await self._play_next(chat_id)
 
     async def pause(self, chat_id: int):
@@ -234,15 +209,9 @@ class Call:
 
     def set_loop(self, chat_id: int, count: int):
         self.loop_remaining[chat_id] = count
-
-        logger.info(
-            "Loop set to %s additional repeats in chat %s",
-            count,
-            chat_id,
-        )
+        logger.info("Loop set to %s additional repeats in chat %s", count, chat_id)
 
     def toggle_loop(self, chat_id: int) -> bool:
-        """Toggle one additional repeat of the current track."""
         if self.get_loop_remaining(chat_id) > 0:
             self.disable_loop(chat_id)
             return False
@@ -256,14 +225,9 @@ class Call:
 
     def disable_loop(self, chat_id: int):
         self.loop_remaining.pop(chat_id, None)
-
-        logger.info(
-            "Loop disabled in chat %s",
-            chat_id,
-        )
+        logger.info("Loop disabled in chat %s", chat_id)
 
     async def _update_player(self, chat_id: int, track):
-        # Local import avoids the core.call <-> plugins.controls import cycle.
         try:
             from plugins.controls import _update_now_playing_message
             await _update_now_playing_message(chat_id, track)
@@ -276,7 +240,6 @@ class Call:
         async def delayed_leave():
             try:
                 await asyncio.sleep(self._leave_delay)
-                # A new track may have arrived while this task was sleeping.
                 if self.get_queue(chat_id).current() is None:
                     await self._leave_locked(chat_id)
             except asyncio.CancelledError:
@@ -299,26 +262,19 @@ class Call:
         try:
             await self.pytgcalls.leave_call(chat_id)
             self._last_leave_at[chat_id] = time.monotonic()
-        except Exception as e:
-            logger.debug("leave_call for %s failed (probably already left): %s", chat_id, e)
+        except Exception as exc:
+            logger.debug("leave_call for %s failed (probably already left): %s", chat_id, exc)
 
 
-# IMPORTANT:
-# Do not create Call(assistant) here.
-# It must be created inside bot.py's running asyncio event loop.
+# Do not create Call(assistant) at import time. Create it inside bot.py's
+# running asyncio event loop.
 call = None
 
 
 def create_call(assistant_client):
-    """
-    Create the PyTgCalls instance from inside
-    the application's running asyncio event loop.
-    """
+    """Create the PyTgCalls instance inside the application's event loop."""
     global call
-
     if call is not None:
         return call
-
     call = Call(assistant_client)
-
     return call
