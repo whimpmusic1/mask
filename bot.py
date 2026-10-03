@@ -46,9 +46,6 @@ async def main():
     logging.info("PyTgCalls started.")
 
     # Load plugins only after the global `call` object exists.
-    # (plugins/controls.py wires itself up to call.on_track_change as
-    # soon as it's imported here - see the bottom of that file - so
-    # there's no separate wiring step to forget in this file.)
     load_plugins()
 
     logging.info(

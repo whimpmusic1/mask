@@ -1,0 +1,16 @@
+[Unit]
+Description=Telegram Music Bot (VC audio/video streaming)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/%i/telegram-music-bot
+ExecStart=/home/%i/telegram-music-bot/.venv/bin/python bot.py
+Restart=always
+RestartSec=5
+EnvironmentFile=/home/%i/telegram-music-bot/.env
+
+[Install]
+WantedBy=multi-user.target
