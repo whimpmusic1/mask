@@ -1,8 +1,13 @@
+import logging
+
 from pyrogram import filters
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 
 import core.call as call_module
 from core.clients import bot
+
+logger = logging.getLogger(__name__)
+
 PLAYER_MESSAGES: dict[int, int] = {}
 
 def remember_player_message(chat_id: int, message_id: int) -> None:
@@ -48,22 +53,38 @@ async def _update_now_playing_message(chat_id: int, track):
     caption = _format_now_playing(track)
     thumbnail = track.get("thumbnail")
 
+    if not thumbnail:
+        logger.info(
+            "No thumbnail on track %r for chat %s - rendering text-only.",
+            track.get("title"),
+            chat_id,
+        )
+
     # No existing player message.
     if message_id is None:
         if thumbnail:
-            msg = await bot.send_photo(
-                chat_id=chat_id,
-                photo=thumbnail,
-                caption=caption,
-                reply_markup=player_keyboard(chat_id),
-            )
-        else:
-            msg = await bot.send_message(
-                chat_id=chat_id,
-                text=caption,
-                reply_markup=player_keyboard(chat_id),
-            )
+            try:
+                msg = await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=thumbnail,
+                    caption=caption,
+                    reply_markup=player_keyboard(chat_id),
+                )
+                PLAYER_MESSAGES[chat_id] = msg.id
+                return
+            except Exception:
+                logger.exception(
+                    "send_photo with thumbnail failed for chat %s "
+                    "(thumbnail url: %r) - falling back to text.",
+                    chat_id,
+                    thumbnail,
+                )
 
+        msg = await bot.send_message(
+            chat_id=chat_id,
+            text=caption,
+            reply_markup=player_keyboard(chat_id),
+        )
         PLAYER_MESSAGES[chat_id] = msg.id
         return
 
@@ -81,9 +102,14 @@ async def _update_now_playing_message(chat_id: int, track):
             )
             return
         except Exception:
-            pass
+            logger.exception(
+                "edit_message_media with thumbnail failed for chat %s "
+                "(thumbnail url: %r) - falling back to caption-only edit.",
+                chat_id,
+                thumbnail,
+            )
 
-    # Fallback if the old message was text.
+    # Fallback if the old message was text, or the photo edit above failed.
     try:
         await bot.edit_message_caption(
             chat_id=chat_id,
@@ -92,7 +118,18 @@ async def _update_now_playing_message(chat_id: int, track):
             reply_markup=player_keyboard(chat_id),
         )
     except Exception:
-        pass
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=caption,
+                reply_markup=player_keyboard(chat_id),
+            )
+        except Exception:
+            logger.exception(
+                "Could not update the player message at all for chat %s",
+                chat_id,
+            )
 
 def player_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     looping = call_module.call.get_loop_remaining(chat_id) > 0
@@ -222,3 +259,23 @@ async def player_button(client, callback_query):
 
     except Exception as exc:
         await callback_query.answer(f"Playback action failed: {exc}", show_alert=True)
+
+
+# Self-register as the hook that renders the player card whenever playback
+# state changes (initial play, skip, a track ending naturally, stop).
+# Done here - at the bottom of this module, at import time - rather than
+# as a separate step in bot.py: plugins are only ever loaded (via
+# load_plugins() in bot.py) after core.call.create_call() has already run,
+# so call_module.call is guaranteed to exist by the time this line runs.
+# Keeping the wiring inside the plugin that owns the UI means there's no
+# separate step to forget when only this file changes.
+if call_module.call is not None:
+    call_module.call.on_track_change = _update_now_playing_message
+    logger.info("Player UI hook registered on the Call instance.")
+else:
+    logger.error(
+        "core.call.call was None when plugins/controls.py loaded - the "
+        "player card will not update automatically. This means plugins "
+        "loaded before create_call() ran, which shouldn't happen; check "
+        "bot.py's startup order."
+    )

@@ -46,15 +46,10 @@ async def main():
     logging.info("PyTgCalls started.")
 
     # Load plugins only after the global `call` object exists.
+    # (plugins/controls.py wires itself up to call.on_track_change as
+    # soon as it's imported here - see the bottom of that file - so
+    # there's no separate wiring step to forget in this file.)
     load_plugins()
-
-    # Wire the player-message UI into every path that changes what's
-    # playing (initial play, skip, a track ending naturally, queue
-    # running out) - done here, after plugins are loaded, as a plain
-    # attribute assignment so there's no import cycle between core.call
-    # and plugins.controls.
-    from plugins.controls import _update_now_playing_message
-    call.on_track_change = _update_now_playing_message
 
     logging.info(
         "Music bot is live - audio-only voice-chat streaming ready."
