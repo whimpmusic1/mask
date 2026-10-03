@@ -161,9 +161,6 @@ class Call:
 
         self._active_chats.add(chat_id)
 
-        if is_fresh_join:
-            asyncio.create_task(self._warm_start_kick(chat_id, track, stream))
-
     # Delays (seconds, between successive attempts) for the warm-start
     # re-kick below. One attempt at 2s turned out not to be reliable
     # enough in practice, so this retries a few times over the first
