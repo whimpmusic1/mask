@@ -55,6 +55,7 @@ async def play_cmd(client, message):
             if message.from_user
             else "someone"
         ),
+        "http_headers": info.get("http_headers") or {},
     }
 
     try:
