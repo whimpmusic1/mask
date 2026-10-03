@@ -122,9 +122,10 @@ class Call:
         headers = track.get("http_headers") or {}
         
         return MediaStream(
-            url,
+            track["url"],
             audio_parameters=AudioQuality.HIGH,
             video_flags=MediaStream.Flags.IGNORE,
+            headers=headers,
         )
 
     async def start(self):
