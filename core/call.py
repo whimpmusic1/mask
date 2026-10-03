@@ -33,6 +33,12 @@ class Call:
         self._chat_locks: dict[int, asyncio.Lock] = {}
         self._manual_transition_at: dict[int, float] = {}
         self.loop_remaining: dict[int, int] = {}
+
+        # Chats where we have a call connection that's already been
+        # "kicked" into actually transmitting audio - see _stream() and
+        # _warm_start_kick() for why this exists.
+        self._active_chats: set[int] = set()
+
         self._register_handlers()
 
     def _chat_lock(self, chat_id: int) -> asyncio.Lock:
@@ -132,6 +138,12 @@ class Call:
             bool(track.get("http_headers")),
         )
         stream = self._build_stream(track)
+
+        # True only the first time we're joining this chat's call fresh -
+        # not on a track switch within an already-active call (those
+        # already work fine with no extra kick needed).
+        is_fresh_join = chat_id not in self._active_chats
+
         try:
             await self.pytgcalls.play(chat_id, stream)
             logger.info(
@@ -147,6 +159,41 @@ class Call:
             )
             raise
 
+        self._active_chats.add(chat_id)
+
+        if is_fresh_join:
+            asyncio.create_task(self._warm_start_kick(chat_id, track, stream))
+
+    async def _warm_start_kick(self, chat_id: int, track: dict, stream: MediaStream):
+        """
+        Diagnosed from: /play joins the call and the UI shows "Now
+        playing", but no audio comes out - for several minutes, well
+        past the track's own duration - until a /skip switches to a
+        different track, at which point the *tail end* of the first
+        track is briefly audible before the new one plays normally.
+        That specific symptom (audio exists, just isn't being
+        transmitted, and a stream re-trigger releases it) matches a
+        known PyTgCalls quirk: a brand-new join can report success
+        immediately while the underlying transport hasn't actually
+        started sending yet. skip() was accidentally "fixing" this by
+        re-issuing play() - this does the same thing automatically,
+        shortly after every fresh join, instead of requiring a manual
+        skip to unstick it.
+        """
+        await asyncio.sleep(2.0)
+
+        queue = self.queues.get(chat_id)
+        if queue is None or queue.current() is not track:
+            # Already skipped/stopped in the meantime - nothing to kick.
+            return
+
+        logger.info("Warm-start: re-kicking stream in chat %s", chat_id)
+        try:
+            await self.pytgcalls.play(chat_id, stream)
+            logger.info("Warm-start re-kick succeeded in chat %s", chat_id)
+        except Exception:
+            logger.exception("Warm-start re-kick failed in chat %s", chat_id)
+
     async def _play_next(self, chat_id: int):
         queue = self.get_queue(chat_id)
         logger.info("Advancing queue in chat %s; size_before=%d", chat_id, len(queue.tracks))
@@ -161,7 +208,7 @@ class Call:
         if next_track is None:
             await self._update_player(chat_id, None)
             self._schedule_leave(chat_id)
-            return
+            return None
 
         try:
             await self._stream(chat_id, next_track)
@@ -169,6 +216,9 @@ class Call:
         except Exception:
             logger.exception("Failed to play next track in chat %s", chat_id)
             await self._leave_locked(chat_id)
+            return None
+
+        return next_track
 
     async def add_and_play(self, chat_id: int, track: dict) -> str:
         """Queue a track and start it if the queue is idle."""
@@ -195,11 +245,12 @@ class Call:
             return "queued"
 
     async def skip(self, chat_id: int):
+        """Returns the new current track, or None if the queue is now empty."""
         async with self._chat_lock(chat_id):
             self.loop_remaining.pop(chat_id, None)
             self._manual_transition_at[chat_id] = time.monotonic()
             logger.info("Manual skip in chat %s", chat_id)
-            await self._play_next(chat_id)
+            return await self._play_next(chat_id)
 
     async def pause(self, chat_id: int):
         await self.pytgcalls.pause(chat_id)
@@ -259,6 +310,7 @@ class Call:
         await self._update_player(chat_id, None)
         self.queues.pop(chat_id, None)
         self.loop_remaining.pop(chat_id, None)
+        self._active_chats.discard(chat_id)
         try:
             await self.pytgcalls.leave_call(chat_id)
             self._last_leave_at[chat_id] = time.monotonic()
