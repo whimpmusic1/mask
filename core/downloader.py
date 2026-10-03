@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import urllib.error
+import urllib.request
 
 import yt_dlp
 
@@ -114,6 +116,77 @@ _VIDEO_OPTS = {
 }
 
 
+def _preflight_check(url: str, headers: dict) -> None:
+    """
+    Verify the resolved stream URL is actually fetchable with its headers
+    BEFORE handing it to PyTgCalls/ffmpeg.
+
+    Why this exists: a warm-start re-kick (repeatedly calling play() after
+    joining) did not fix reports of "joined the voice chat, UI says
+    playing, but total silence for several minutes" - and on its 3rd
+    retry it crashed inside PyTgCalls' own internals (reusing a
+    MediaStream object across multiple play() calls corrupts its internal
+    state). That ruled out "the connection just needs a nudge" as the
+    explanation. The next most likely cause: yt-dlp resolves URLs through
+    its own cookie/PO-token-aware HTTP stack, but ffmpeg (which is what
+    actually fetches the audio once PyTgCalls starts playing) makes a
+    plain request with only the headers we hand it - if those don't
+    match what the URL actually requires, ffmpeg's fetch can be silently
+    rejected while PyTgCalls still reports a successful *join* (joining
+    the voice chat and fetching the media are two separate things).
+
+    This makes that failure mode loud and immediate instead of 7 minutes
+    of silence: fetch a small range of the URL with the exact headers
+    ffmpeg will use, and raise a clear error before ever joining the call
+    if it's rejected.
+    """
+    request_headers = dict(headers)
+    request_headers.setdefault("Range", "bytes=0-8191")
+
+    req = urllib.request.Request(url, headers=request_headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            chunk = resp.read(1024)
+            logger.info(
+                "Stream URL preflight OK: status=%s bytes_read=%d",
+                resp.status,
+                len(chunk),
+            )
+            if not chunk:
+                logger.warning(
+                    "Stream URL preflight got status %s but ZERO bytes "
+                    "back - this may still end up silent in playback.",
+                    resp.status,
+                )
+    except urllib.error.HTTPError as e:
+        logger.error(
+            "Stream URL preflight FAILED: HTTP %s %s - ffmpeg would "
+            "almost certainly have failed to fetch this too, which is "
+            "what produces 'joined but silent' rather than a visible "
+            "error. Headers sent: %s",
+            e.code,
+            e.reason,
+            sorted(request_headers.keys()),
+        )
+        if e.code in (401, 403, 404):
+            raise RuntimeError(
+                f"The resolved stream link was rejected (HTTP {e.code}) "
+                "when tested directly - it would not have played even "
+                "though joining the voice chat would have looked fine."
+            ) from e
+    except Exception as e:
+        # Don't hard-fail on non-HTTP errors (DNS blip, transient
+        # timeout) - log it clearly and let playback attempt proceed,
+        # since this check is a diagnostic/fast-fail aid, not a
+        # guarantee either way.
+        logger.error(
+            "Stream URL preflight error (%s): %s - proceeding anyway, "
+            "but if playback is silent this is the first place to look.",
+            type(e).__name__,
+            e,
+        )
+
+
 async def get_stream_info(query: str, video: bool = False) -> dict:
     loop = asyncio.get_running_loop()
 
@@ -146,7 +219,7 @@ async def get_stream_info(query: str, video: bool = False) -> dict:
             "yt-dlp could not resolve a playable stream."
         )
 
-    return {
+    result = {
         "title": info.get("title") or query,
         "duration": info.get("duration") or 0,
         "url": stream_url,
@@ -154,3 +227,9 @@ async def get_stream_info(query: str, video: bool = False) -> dict:
         "thumbnail": info.get("thumbnail"),
         "http_headers": info.get("http_headers") or {},
     }
+
+    await loop.run_in_executor(
+        None, _preflight_check, result["url"], result["http_headers"]
+    )
+
+    return result

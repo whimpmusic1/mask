@@ -34,9 +34,9 @@ class Call:
         self._manual_transition_at: dict[int, float] = {}
         self.loop_remaining: dict[int, int] = {}
 
-        # Chats where we have a call connection that's already been
-        # "kicked" into actually transmitting audio - see _stream() and
-        # _warm_start_kick() for why this exists.
+        # Chats where we currently have an active call connection -
+        # used to tell a fresh join apart from a track switch within an
+        # already-active call.
         self._active_chats: set[int] = set()
 
         self._register_handlers()
@@ -139,11 +139,6 @@ class Call:
         )
         stream = self._build_stream(track)
 
-        # True only the first time we're joining this chat's call fresh -
-        # not on a track switch within an already-active call (those
-        # already work fine with no extra kick needed).
-        is_fresh_join = chat_id not in self._active_chats
-
         try:
             await self.pytgcalls.play(chat_id, stream)
             logger.info(
@@ -160,63 +155,6 @@ class Call:
             raise
 
         self._active_chats.add(chat_id)
-
-    # Delays (seconds, between successive attempts) for the warm-start
-    # re-kick below. One attempt at 2s turned out not to be reliable
-    # enough in practice, so this retries a few times over the first
-    # ~10 seconds instead of giving up after a single try.
-    _WARM_START_DELAYS = (1.0, 3.0, 6.0)
-
-    async def _warm_start_kick(self, chat_id: int, track: dict, stream: MediaStream):
-        """
-        Diagnosed from: /play joins the call and the UI shows "Now
-        playing", but no audio comes out - for several minutes, well
-        past the track's own duration - until a /skip switches to a
-        different track, at which point the *tail end* of the first
-        track is briefly audible before the new one plays normally.
-        That specific symptom (audio exists, just isn't being
-        transmitted, and a stream re-trigger releases it) matches a
-        known PyTgCalls quirk: a brand-new join can report success
-        immediately while the underlying transport hasn't actually
-        started sending yet. skip() was accidentally "fixing" this by
-        re-issuing play() - this does the same thing automatically,
-        at a few points after every fresh join, instead of requiring a
-        manual skip to unstick it.
-
-        If audio is STILL silent on first play after this, the logs
-        from this method (search for "Warm-start" in Railway's logs)
-        will show whether these re-kicks are even firing/succeeding -
-        that's the next real diagnostic signal needed, since this
-        behavior depends on PyTgCalls/Telegram internals that can't be
-        verified without a live call to test against.
-        """
-        for attempt, delay in enumerate(self._WARM_START_DELAYS, start=1):
-            await asyncio.sleep(delay)
-
-            queue = self.queues.get(chat_id)
-            if queue is None or queue.current() is not track:
-                logger.info(
-                    "Warm-start attempt %d/%d for chat %s skipped - "
-                    "track changed already.",
-                    attempt, len(self._WARM_START_DELAYS), chat_id,
-                )
-                return
-
-            logger.info(
-                "Warm-start attempt %d/%d: re-kicking stream in chat %s",
-                attempt, len(self._WARM_START_DELAYS), chat_id,
-            )
-            try:
-                await self.pytgcalls.play(chat_id, stream)
-                logger.info(
-                    "Warm-start attempt %d/%d succeeded in chat %s",
-                    attempt, len(self._WARM_START_DELAYS), chat_id,
-                )
-            except Exception:
-                logger.exception(
-                    "Warm-start attempt %d/%d failed in chat %s",
-                    attempt, len(self._WARM_START_DELAYS), chat_id,
-                )
 
     async def _play_next(self, chat_id: int):
         queue = self.get_queue(chat_id)
