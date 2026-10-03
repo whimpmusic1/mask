@@ -1,10 +1,10 @@
 from pyrogram import filters
-from pyrogram.types import InputMediaPhoto
 
 from config import Config
 import core.call as call_module
 from core.clients import bot
 from core.downloader import get_stream_info
+from plugins.controls import _update_now_playing_message
 
 
 @bot.on_message(filters.command(["play", "vplay"]) & filters.group)
@@ -75,32 +75,15 @@ async def play_cmd(client, message):
     kind = "video" if video else "audio"
 
     if state == "playing":
-        # The player card itself is rendered by call.on_track_change
-        # (wired in bot.py to plugins.controls._update_now_playing_message)
-        # - that's the single place that creates/edits it, so every path
-        # that starts a track (first play, skip, auto-advance) renders the
-        # same way instead of each call site duplicating the logic.
         try:
             await status.delete()
         except Exception:
             pass
-        return
-
-    # Queued (something else is already playing) - no player controls
-    # here since those control the *currently playing* track, not this
-    # one; just a nice preview with the thumbnail so it doesn't look like
-    # a bare text fallback.
-    caption = (
-        f"➕ **Queued** ({kind}): {info['title']}\n"
-        f"Use /queue to view the playlist."
-    )
-    thumbnail = info.get("thumbnail")
-
-    if thumbnail:
-        try:
-            await status.edit_media(InputMediaPhoto(thumbnail, caption=caption))
-            return
-        except Exception:
-            pass
-
-    await status.edit_text(caption)
+        # The Call layer owns the shared player message and updates it on every
+        # track transition; this also repairs the panel after a fresh /play.
+        await _update_now_playing_message(chat_id, track)
+    else:
+        await status.edit_text(
+            f"➕ Queued ({kind}): {info['title']}\n"
+            f"Use /queue to view the playlist."
+        )

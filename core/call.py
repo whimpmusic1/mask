@@ -1,4 +1,6 @@
+import asyncio
 import logging
+import time
 
 import pyrogram.errors
 
@@ -10,9 +12,6 @@ if not hasattr(pyrogram.errors, "GroupcallForbidden"):
             pyrogram.errors.GroupCallForbidden
         )
 
-import asyncio
-import time
-
 from pytgcalls import PyTgCalls
 from pytgcalls import filters as fl
 from pytgcalls.types import AudioQuality, MediaStream, StreamEnded
@@ -20,16 +19,6 @@ from pytgcalls.types import AudioQuality, MediaStream, StreamEnded
 from core.queue import MusicQueue
 
 logger = logging.getLogger(__name__)
-
-# After actually leaving a call, wait at least this long before rejoining -
-# rejoining too fast after a real leave is what causes "joined but no
-# audio" (see _stream below for the full explanation).
-_MIN_REJOIN_GAP_SECONDS = 1.5
-
-# Don't leave the call the instant the queue empties - give this long for
-# a follow-up /play to show up first, so back-to-back play/skip/play never
-# has to actually leave+rejoin at all (see _play_next).
-_EMPTY_QUEUE_GRACE_SECONDS = 5
 
 
 class Call:
@@ -41,40 +30,19 @@ class Call:
         self.pytgcalls = PyTgCalls(assistant_client)
 
         self.queues: dict[int, MusicQueue] = {}
+        # Delay teardown after the last track so an immediate /play can reuse
+        # the active Telegram voice-chat connection.
+        self._leave_tasks: dict[int, asyncio.Task] = {}
+        self._last_leave_at: dict[int, float] = {}
+        self._leave_delay = 5.0
+        self._join_cooldown = 1.5
 
         # Number of additional times the current song should repeat.
         # Example:
         # /loop 5 -> current song repeats 5 additional times.
         self.loop_remaining: dict[int, int] = {}
 
-        # chat_id -> asyncio.Task for a scheduled "actually leave now"
-        # once the queue has been empty for _EMPTY_QUEUE_GRACE_SECONDS.
-        self._pending_leave: dict[int, asyncio.Task] = {}
-
-        # chat_id -> time.monotonic() of the last real leave_call(), used
-        # to enforce _MIN_REJOIN_GAP_SECONDS before joining again.
-        self._last_left_at: dict[int, float] = {}
-
-        # Optional async callback: on_track_change(chat_id, track_or_None).
-        # Set from bot.py once plugins are loaded, so the UI (the player
-        # message in plugins/controls.py) can stay in sync with *every*
-        # path that changes what's playing - initial play, skip, a track
-        # ending naturally, or the queue running out. Kept as a plain
-        # settable attribute (not an import) specifically to avoid any
-        # import cycle between core.call and plugins.controls.
-        self.on_track_change = None
-
         self._register_handlers()
-
-    async def _notify_track_change(self, chat_id: int, track):
-        if self.on_track_change is None:
-            return
-        try:
-            await self.on_track_change(chat_id, track)
-        except Exception:
-            logger.exception(
-                "on_track_change hook failed for chat %s", chat_id
-            )
 
     def get_queue(self, chat_id: int) -> MusicQueue:
         if chat_id not in self.queues:
@@ -139,66 +107,22 @@ class Call:
         await self.pytgcalls.start()
 
     def _cancel_pending_leave(self, chat_id: int) -> None:
-        task = self._pending_leave.pop(chat_id, None)
-        if task is not None and not task.done():
+        task = self._leave_tasks.pop(chat_id, None)
+        if task and not task.done():
             task.cancel()
 
-    async def _delayed_leave(self, chat_id: int) -> None:
-        try:
-            await asyncio.sleep(_EMPTY_QUEUE_GRACE_SECONDS)
-        except asyncio.CancelledError:
-            # A new track showed up in time (add_and_play cancelled us) -
-            # the call is still active and already playing it, nothing to do.
-            return
-
-        queue = self.queues.get(chat_id)
-        if queue is None or queue.current() is None:
-            logger.info(
-                "Queue in %s still empty after grace period - leaving.",
-                chat_id,
-            )
-            await self._do_leave(chat_id)
-
-        self._pending_leave.pop(chat_id, None)
-
-    async def _do_leave(self, chat_id: int) -> None:
-        self.queues.pop(chat_id, None)
-        self.loop_remaining.pop(chat_id, None)
-
-        try:
-            await self.pytgcalls.leave_call(chat_id)
-        except Exception as e:
-            logger.debug(
-                "leave_call for %s failed (probably already left): %s",
-                chat_id,
-                e,
-            )
-        finally:
-            self._last_left_at[chat_id] = time.monotonic()
+    async def _wait_for_join_cooldown(self, chat_id: int) -> None:
+        left_at = self._last_leave_at.get(chat_id)
+        if left_at is not None:
+            remaining = self._join_cooldown - (time.monotonic() - left_at)
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+            self._last_leave_at.pop(chat_id, None)
 
     async def _stream(self, chat_id: int, track: dict):
-        """
-        Start an audio stream, auto-creating the voice chat if needed.
-
-        Important: if we actually left this chat's call recently, wait
-        out a short minimum gap before rejoining. Rejoining a Telegram
-        voice chat immediately after leaving it can race with the
-        server/pytgcalls still tearing down the previous session -
-        pytgcalls reports the join as successful and nothing raises, but
-        no audio ever actually flows. This is exactly what was causing
-        "play -> skip -> play" to go silent: skip emptied the queue,
-        which used to leave the call immediately, and the very next
-        /play rejoined too fast. Giving the queue a short grace period
-        before actually leaving (see _play_next/add_and_play) avoids
-        the leave+rejoin cycle entirely for the common case; this gap
-        is the backstop for whenever a real leave did happen.
-        """
-        last_left = self._last_left_at.get(chat_id)
-        if last_left is not None:
-            elapsed = time.monotonic() - last_left
-            if elapsed < _MIN_REJOIN_GAP_SECONDS:
-                await asyncio.sleep(_MIN_REJOIN_GAP_SECONDS - elapsed)
-
+        """Start an audio stream, reusing a call if teardown is pending."""
+        self._cancel_pending_leave(chat_id)
+        await self._wait_for_join_cooldown(chat_id)
         stream = self._build_stream(track["url"])
 
         try:
@@ -227,14 +151,8 @@ class Call:
         next_track = queue.advance()
 
         if next_track is None:
-            # Don't leave immediately - see _delayed_leave's docstring
-            # and _stream's: this is the fix for play -> skip -> play
-            # going silent.
-            self._cancel_pending_leave(chat_id)
-            self._pending_leave[chat_id] = asyncio.create_task(
-                self._delayed_leave(chat_id)
-            )
-            await self._notify_track_change(chat_id, None)
+            await self._update_player(chat_id, None)
+            self._schedule_leave(chat_id)
             return
 
         try:
@@ -242,6 +160,7 @@ class Call:
                 chat_id,
                 next_track,
             )
+            await self._update_player(chat_id, next_track)
 
         except Exception:
             logger.exception(
@@ -249,11 +168,7 @@ class Call:
                 chat_id,
             )
 
-            await self._do_leave(chat_id)
-            await self._notify_track_change(chat_id, None)
-            return
-
-        await self._notify_track_change(chat_id, next_track)
+            await self.leave(chat_id)
 
     async def add_and_play(
         self,
@@ -262,6 +177,7 @@ class Call:
     ) -> str:
         """Add an audio track; play immediately if queue is idle."""
 
+        self._cancel_pending_leave(chat_id)
         queue = self.get_queue(chat_id)
 
         was_empty = queue.current() is None
@@ -269,11 +185,6 @@ class Call:
         queue.add(track)
 
         if was_empty:
-            # A follow-up /play showed up inside the grace period - cancel
-            # the scheduled leave so we never actually drop the call, and
-            # pytgcalls.play() below just switches the stream smoothly.
-            self._cancel_pending_leave(chat_id)
-
             try:
                 await self._stream(
                     chat_id,
@@ -284,7 +195,7 @@ class Call:
                 queue.clear()
                 raise
 
-            await self._notify_track_change(chat_id, track)
+            await self._update_player(chat_id, track)
             return "playing"
 
         return "queued"
@@ -330,11 +241,47 @@ class Call:
             chat_id,
         )
 
-    async def leave(self, chat_id: int):
-        """Manual /stop - leaves immediately, no grace period."""
+    async def _update_player(self, chat_id: int, track):
+        # Local import avoids the core.call <-> plugins.controls import cycle.
+        try:
+            from plugins.controls import _update_now_playing_message
+            await _update_now_playing_message(chat_id, track)
+        except Exception:
+            logger.exception("Failed to update player message in chat %s", chat_id)
+
+    def _schedule_leave(self, chat_id: int) -> None:
         self._cancel_pending_leave(chat_id)
-        await self._do_leave(chat_id)
-        await self._notify_track_change(chat_id, None)
+
+        async def delayed_leave():
+            try:
+                await asyncio.sleep(self._leave_delay)
+                # A new track may have arrived while this task was sleeping.
+                if self.get_queue(chat_id).current() is None:
+                    await self.leave(chat_id)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                if self._leave_tasks.get(chat_id) is asyncio.current_task():
+                    self._leave_tasks.pop(chat_id, None)
+
+        self._leave_tasks[chat_id] = asyncio.create_task(delayed_leave())
+
+    async def leave(self, chat_id: int):
+        self._cancel_pending_leave(chat_id)
+        await self._update_player(chat_id, None)
+        self.queues.pop(chat_id, None)
+        self.loop_remaining.pop(chat_id, None)
+
+        try:
+            await self.pytgcalls.leave_call(chat_id)
+            self._last_leave_at[chat_id] = time.monotonic()
+
+        except Exception as e:
+            logger.debug(
+                "leave_call for %s failed (probably already left): %s",
+                chat_id,
+                e,
+            )
 
 
 # IMPORTANT:
