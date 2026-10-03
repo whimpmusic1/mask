@@ -152,4 +152,5 @@ async def get_stream_info(query: str, video: bool = False) -> dict:
         "url": stream_url,
         "webpage_url": info.get("webpage_url"),
         "thumbnail": info.get("thumbnail"),
+        "http_headers": info.get("http_headers") or {},
     }
