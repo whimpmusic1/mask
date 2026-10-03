@@ -119,6 +119,8 @@ class Call:
 
 
     def _build_stream(self, url: str) -> MediaStream:
+        headers = track.get("http_headers") or {}
+        
         return MediaStream(
             url,
             audio_parameters=AudioQuality.HIGH,
@@ -145,7 +147,15 @@ class Call:
         """Start an audio stream, reusing a call if teardown is pending."""
         self._cancel_pending_leave(chat_id)
         await self._wait_for_join_cooldown(chat_id)
-        stream = self._build_stream(track["url"])
+        stream = self._build_stream(track)
+
+        logger.info(
+            "Starting stream in chat %s: title=%r, duration=%s, headers_present=%s",
+            chat_id,
+            track.get("title"),
+            track.get("duration"),
+            bool(track.get("http_headers")),
+        )
 
         try:
             await self.pytgcalls.play(
