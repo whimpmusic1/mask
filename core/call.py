@@ -164,6 +164,12 @@ class Call:
         if is_fresh_join:
             asyncio.create_task(self._warm_start_kick(chat_id, track, stream))
 
+    # Delays (seconds, between successive attempts) for the warm-start
+    # re-kick below. One attempt at 2s turned out not to be reliable
+    # enough in practice, so this retries a few times over the first
+    # ~10 seconds instead of giving up after a single try.
+    _WARM_START_DELAYS = (1.0, 3.0, 6.0)
+
     async def _warm_start_kick(self, chat_id: int, track: dict, stream: MediaStream):
         """
         Diagnosed from: /play joins the call and the UI shows "Now
@@ -177,22 +183,43 @@ class Call:
         immediately while the underlying transport hasn't actually
         started sending yet. skip() was accidentally "fixing" this by
         re-issuing play() - this does the same thing automatically,
-        shortly after every fresh join, instead of requiring a manual
-        skip to unstick it.
+        at a few points after every fresh join, instead of requiring a
+        manual skip to unstick it.
+
+        If audio is STILL silent on first play after this, the logs
+        from this method (search for "Warm-start" in Railway's logs)
+        will show whether these re-kicks are even firing/succeeding -
+        that's the next real diagnostic signal needed, since this
+        behavior depends on PyTgCalls/Telegram internals that can't be
+        verified without a live call to test against.
         """
-        await asyncio.sleep(2.0)
+        for attempt, delay in enumerate(self._WARM_START_DELAYS, start=1):
+            await asyncio.sleep(delay)
 
-        queue = self.queues.get(chat_id)
-        if queue is None or queue.current() is not track:
-            # Already skipped/stopped in the meantime - nothing to kick.
-            return
+            queue = self.queues.get(chat_id)
+            if queue is None or queue.current() is not track:
+                logger.info(
+                    "Warm-start attempt %d/%d for chat %s skipped - "
+                    "track changed already.",
+                    attempt, len(self._WARM_START_DELAYS), chat_id,
+                )
+                return
 
-        logger.info("Warm-start: re-kicking stream in chat %s", chat_id)
-        try:
-            await self.pytgcalls.play(chat_id, stream)
-            logger.info("Warm-start re-kick succeeded in chat %s", chat_id)
-        except Exception:
-            logger.exception("Warm-start re-kick failed in chat %s", chat_id)
+            logger.info(
+                "Warm-start attempt %d/%d: re-kicking stream in chat %s",
+                attempt, len(self._WARM_START_DELAYS), chat_id,
+            )
+            try:
+                await self.pytgcalls.play(chat_id, stream)
+                logger.info(
+                    "Warm-start attempt %d/%d succeeded in chat %s",
+                    attempt, len(self._WARM_START_DELAYS), chat_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Warm-start attempt %d/%d failed in chat %s",
+                    attempt, len(self._WARM_START_DELAYS), chat_id,
+                )
 
     async def _play_next(self, chat_id: int):
         queue = self.get_queue(chat_id)

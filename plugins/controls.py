@@ -47,49 +47,41 @@ async def _update_now_playing_message(chat_id: int, track):
     thumbnail = track.get("thumbnail")
     markup = player_keyboard(chat_id)
 
-    if message_id is None:
-        msg = None
-        if thumbnail:
-            try:
-                msg = await bot.send_photo(
-                    chat_id=chat_id, photo=thumbnail, caption=caption,
-                    reply_markup=markup,
-                )
-            except Exception as exc:
-                logger.warning("Player thumbnail send failed in %s; using text panel: %s", chat_id, exc)
-        if msg is None:
-            msg = await bot.send_message(chat_id=chat_id, text=caption, reply_markup=markup)
-        PLAYER_MESSAGES[chat_id] = msg.id
-        return
-
-    # Replace artwork whenever possible. If Telegram rejects the thumbnail,
-    # delete the old photo panel and recreate a text panel so stale artwork
-    # cannot be mistaken for the current track.
-    if thumbnail:
+    # Always delete the old player message (if any) and send a fresh one,
+    # rather than editing in place. Diagnosed cause of the "no thumbnail
+    # after skip" bug: editing an existing message's media with a BRAND
+    # NEW external URL is noticeably less reliable in Telegram's API than
+    # sending that same URL fresh - when the edit failed, the old code
+    # fell back to deleting the photo and sending plain text, permanently
+    # losing the image for that track. Sending fresh every time uses the
+    # exact same (reliable) send_photo path as the very first /play, so
+    # there's no separate, flakier code path for transitions. As a bonus,
+    # the player card now always reappears as the newest message instead
+    # of silently updating one further up in the scrollback where it's
+    # easy to miss.
+    if message_id is not None:
         try:
-            await bot.edit_message_media(
-                chat_id=chat_id, message_id=message_id,
-                media=InputMediaPhoto(media=thumbnail, caption=caption),
-                reply_markup=markup,
-            )
-            return
-        except Exception as exc:
-            logger.warning("Player media edit failed in %s; falling back to text: %s", chat_id, exc)
-    else:
-        try:
-            await bot.edit_message_text(
-                chat_id=chat_id, message_id=message_id,
-                text=caption, reply_markup=markup,
-            )
-            return
+            await bot.delete_messages(chat_id, message_id)
         except Exception:
             pass
+        PLAYER_MESSAGES.pop(chat_id, None)
 
-    try:
-        await bot.delete_messages(chat_id, message_id)
-    except Exception:
-        pass
-    msg = await bot.send_message(chat_id=chat_id, text=caption, reply_markup=markup)
+    msg = None
+    if thumbnail:
+        try:
+            msg = await bot.send_photo(
+                chat_id=chat_id, photo=thumbnail, caption=caption,
+                reply_markup=markup,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Player thumbnail send failed in %s; using text panel: %s",
+                chat_id, exc,
+            )
+
+    if msg is None:
+        msg = await bot.send_message(chat_id=chat_id, text=caption, reply_markup=markup)
+
     PLAYER_MESSAGES[chat_id] = msg.id
 
 def player_keyboard(chat_id: int) -> InlineKeyboardMarkup:
@@ -146,8 +138,13 @@ async def resume_cmd(client, message):
 
 @bot.on_message(filters.command("skip"))
 async def skip_cmd(client, message):
+    # call.skip() -> _play_next() -> _update_player() already sends a
+    # fresh player card for the new track (or "Playback finished"). A
+    # separate "Skipped." text here was just clutter below that card -
+    # and was the main reason skip *looked* like it lost the thumbnail:
+    # the real (working) card was further up, and this plain-text message
+    # was the newest thing visible at the bottom of the chat.
     await call_module.call.skip(message.chat.id)
-    await message.reply_text("⏭ Skipped.")
 
 
 @bot.on_message(filters.command("stop"))
