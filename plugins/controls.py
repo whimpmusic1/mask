@@ -1,8 +1,10 @@
 from pyrogram import filters
+import logging
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 
 import core.call as call_module
 from core.clients import bot
+logger = logging.getLogger(__name__)
 PLAYER_MESSAGES: dict[int, int] = {}
 
 def remember_player_message(chat_id: int, message_id: int) -> None:
@@ -20,79 +22,75 @@ def _format_now_playing(track: dict) -> str:
         f"👤 Requested by {track.get('requested_by', 'someone')}"
     )
 async def _update_now_playing_message(chat_id: int, track):
+    """Create/update one player panel; thumbnail failures never break playback."""
     message_id = PLAYER_MESSAGES.get(chat_id)
+    finished_text = "⏹ **Playback finished**\n\nThe queue is empty."
 
     if not track:
         if message_id:
             try:
                 await bot.edit_message_caption(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    caption="⏹ **Playback finished**\n\nThe queue is empty.",
-                    reply_markup=None,
+                    chat_id=chat_id, message_id=message_id,
+                    caption=finished_text, reply_markup=None,
                 )
             except Exception:
                 try:
                     await bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        text="⏹ **Playback finished**\n\nThe queue is empty.",
-                        reply_markup=None,
+                        chat_id=chat_id, message_id=message_id,
+                        text=finished_text, reply_markup=None,
                     )
                 except Exception:
                     pass
-
-        PLAYER_MESSAGES.pop(chat_id, None)
         return
 
     caption = _format_now_playing(track)
     thumbnail = track.get("thumbnail")
+    markup = player_keyboard(chat_id)
 
-    # No existing player message.
     if message_id is None:
+        msg = None
         if thumbnail:
-            msg = await bot.send_photo(
-                chat_id=chat_id,
-                photo=thumbnail,
-                caption=caption,
-                reply_markup=player_keyboard(chat_id),
-            )
-        else:
-            msg = await bot.send_message(
-                chat_id=chat_id,
-                text=caption,
-                reply_markup=player_keyboard(chat_id),
-            )
-
+            try:
+                msg = await bot.send_photo(
+                    chat_id=chat_id, photo=thumbnail, caption=caption,
+                    reply_markup=markup,
+                )
+            except Exception as exc:
+                logger.warning("Player thumbnail send failed in %s; using text panel: %s", chat_id, exc)
+        if msg is None:
+            msg = await bot.send_message(chat_id=chat_id, text=caption, reply_markup=markup)
         PLAYER_MESSAGES[chat_id] = msg.id
         return
 
-    # Existing player message is a photo.
+    # Replace artwork whenever possible. If Telegram rejects the thumbnail,
+    # delete the old photo panel and recreate a text panel so stale artwork
+    # cannot be mistaken for the current track.
     if thumbnail:
         try:
             await bot.edit_message_media(
-                chat_id=chat_id,
-                message_id=message_id,
-                media=InputMediaPhoto(
-                    media=thumbnail,
-                    caption=caption,
-                ),
-                reply_markup=player_keyboard(chat_id),
+                chat_id=chat_id, message_id=message_id,
+                media=InputMediaPhoto(media=thumbnail, caption=caption),
+                reply_markup=markup,
+            )
+            return
+        except Exception as exc:
+            logger.warning("Player media edit failed in %s; falling back to text: %s", chat_id, exc)
+    else:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id,
+                text=caption, reply_markup=markup,
             )
             return
         except Exception:
             pass
 
-    # Fallback if the old message was text.
     try:
-        await bot.edit_message_caption(
-            chat_id=chat_id,
-            message_id=message_id,
-            caption=caption,
-            reply_markup=player_keyboard(chat_id),
-        )
+        await bot.delete_messages(chat_id, message_id)
     except Exception:
         pass
+    msg = await bot.send_message(chat_id=chat_id, text=caption, reply_markup=markup)
+    PLAYER_MESSAGES[chat_id] = msg.id
 
 def player_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     looping = call_module.call.get_loop_remaining(chat_id) > 0

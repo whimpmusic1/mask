@@ -36,6 +36,11 @@ class Call:
         self._last_leave_at: dict[int, float] = {}
         self._leave_delay = 5.0
         self._join_cooldown = 1.5
+        # Serialize play/skip/end transitions per chat. A short suppression
+        # window prevents a replaced stream's delayed end event from skipping
+        # the newly-started track a second time.
+        self._chat_locks: dict[int, asyncio.Lock] = {}
+        self._manual_transition_at: dict[int, float] = {}
 
         # Number of additional times the current song should repeat.
         # Example:
@@ -43,6 +48,11 @@ class Call:
         self.loop_remaining: dict[int, int] = {}
 
         self._register_handlers()
+
+    def _chat_lock(self, chat_id: int) -> asyncio.Lock:
+        if chat_id not in self._chat_locks:
+            self._chat_locks[chat_id] = asyncio.Lock()
+        return self._chat_locks[chat_id]
 
     def get_queue(self, chat_id: int) -> MusicQueue:
         if chat_id not in self.queues:
@@ -60,41 +70,53 @@ class Call:
                 chat_id,
             )
 
-            # Repeat the current track if loop count is active.
-            remaining = self.loop_remaining.get(chat_id, 0)
-
-            if remaining > 0:
-                queue = self.get_queue(chat_id)
-                current = queue.current()
-
-                if current is not None:
-                    self.loop_remaining[chat_id] = remaining - 1
-
-                    logger.info(
-                        "Looping current track in chat %s. "
-                        "Remaining repeats: %s",
-                        chat_id,
-                        remaining - 1,
-                    )
-
-                    try:
-                        await self._stream(
-                            chat_id,
-                            current,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Failed to loop current track in chat %s",
-                            chat_id,
-                        )
-                        await self.leave(chat_id)
-
+            async with self._chat_lock(chat_id):
+                # play() may emit the replaced stream's end event shortly after
+                # an explicit skip. Do not advance the queue twice.
+                changed_at = self._manual_transition_at.get(chat_id, 0.0)
+                if time.monotonic() - changed_at < 2.5:
+                    logger.info("Ignoring stale stream-end during transition in chat %s", chat_id)
                     return
 
-            # Normal queue behaviour.
-            self.loop_remaining.pop(chat_id, None)
+                await self._handle_stream_end(chat_id)
 
-            await self._play_next(chat_id)
+    async def _handle_stream_end(self, chat_id: int):
+        # Repeat the current track if loop count is active.
+        remaining = self.loop_remaining.get(chat_id, 0)
+
+        if remaining > 0:
+            queue = self.get_queue(chat_id)
+            current = queue.current()
+
+            if current is not None:
+                self.loop_remaining[chat_id] = remaining - 1
+
+                logger.info(
+                    "Looping current track in chat %s. "
+                    "Remaining repeats: %s",
+                    chat_id,
+                    remaining - 1,
+                )
+
+                try:
+                    await self._stream(
+                        chat_id,
+                        current,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to loop current track in chat %s",
+                        chat_id,
+                    )
+                    await self._leave_locked(chat_id)
+
+                return
+
+        # Normal queue behaviour.
+        self.loop_remaining.pop(chat_id, None)
+
+        await self._play_next(chat_id)
+
 
     def _build_stream(self, url: str) -> MediaStream:
         return MediaStream(
@@ -168,42 +190,30 @@ class Call:
                 chat_id,
             )
 
-            await self.leave(chat_id)
+            await self._leave_locked(chat_id)
 
-    async def add_and_play(
-        self,
-        chat_id: int,
-        track: dict,
-    ) -> str:
-        """Add an audio track; play immediately if queue is idle."""
-
-        self._cancel_pending_leave(chat_id)
-        queue = self.get_queue(chat_id)
-
-        was_empty = queue.current() is None
-
-        queue.add(track)
-
-        if was_empty:
-            try:
-                await self._stream(
-                    chat_id,
-                    track,
-                )
-
-            except Exception:
-                queue.clear()
-                raise
-
-            await self._update_player(chat_id, track)
-            return "playing"
-
-        return "queued"
+    async def add_and_play(self, chat_id: int, track: dict) -> str:
+        """Add a track and start it if this chat's queue is idle."""
+        async with self._chat_lock(chat_id):
+            self._cancel_pending_leave(chat_id)
+            queue = self.get_queue(chat_id)
+            was_empty = queue.current() is None
+            queue.add(track)
+            if was_empty:
+                try:
+                    await self._stream(chat_id, track)
+                except Exception:
+                    queue.clear()
+                    raise
+                await self._update_player(chat_id, track)
+                return "playing"
+            return "queued"
 
     async def skip(self, chat_id: int):
-        # Skipping cancels the current loop.
-        self.loop_remaining.pop(chat_id, None)
-        await self._play_next(chat_id)
+        async with self._chat_lock(chat_id):
+            self.loop_remaining.pop(chat_id, None)
+            self._manual_transition_at[chat_id] = time.monotonic()
+            await self._play_next(chat_id)
 
     async def pause(self, chat_id: int):
         await self.pytgcalls.pause(chat_id)
@@ -257,7 +267,7 @@ class Call:
                 await asyncio.sleep(self._leave_delay)
                 # A new track may have arrived while this task was sleeping.
                 if self.get_queue(chat_id).current() is None:
-                    await self.leave(chat_id)
+                    await self._leave_locked(chat_id)
             except asyncio.CancelledError:
                 pass
             finally:
@@ -267,21 +277,19 @@ class Call:
         self._leave_tasks[chat_id] = asyncio.create_task(delayed_leave())
 
     async def leave(self, chat_id: int):
+        async with self._chat_lock(chat_id):
+            await self._leave_locked(chat_id)
+
+    async def _leave_locked(self, chat_id: int):
         self._cancel_pending_leave(chat_id)
         await self._update_player(chat_id, None)
         self.queues.pop(chat_id, None)
         self.loop_remaining.pop(chat_id, None)
-
         try:
             await self.pytgcalls.leave_call(chat_id)
             self._last_leave_at[chat_id] = time.monotonic()
-
         except Exception as e:
-            logger.debug(
-                "leave_call for %s failed (probably already left): %s",
-                chat_id,
-                e,
-            )
+            logger.debug("leave_call for %s failed (probably already left): %s", chat_id, e)
 
 
 # IMPORTANT:

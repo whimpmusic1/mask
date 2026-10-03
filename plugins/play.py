@@ -4,7 +4,6 @@ from config import Config
 import core.call as call_module
 from core.clients import bot
 from core.downloader import get_stream_info
-from plugins.controls import _update_now_playing_message
 
 
 @bot.on_message(filters.command(["play", "vplay"]) & filters.group)
@@ -79,9 +78,6 @@ async def play_cmd(client, message):
             await status.delete()
         except Exception:
             pass
-        # The Call layer owns the shared player message and updates it on every
-        # track transition; this also repairs the panel after a fresh /play.
-        await _update_now_playing_message(chat_id, track)
     else:
         await status.edit_text(
             f"➕ Queued ({kind}): {info['title']}\n"
