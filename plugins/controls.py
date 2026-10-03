@@ -148,8 +148,11 @@ async def resume_cmd(client, message):
 
 @bot.on_message(filters.command("skip"))
 async def skip_cmd(client, message):
+    # call.skip() internally calls _play_next(), which fires
+    # on_track_change -> _update_now_playing_message - the player card
+    # updates to the next track (or "Playback finished") on its own, so
+    # there's nothing else to render here.
     await call_module.call.skip(message.chat.id)
-    await message.reply_text("⏭ Skipped.")
 
 
 @bot.on_message(filters.command("stop"))
@@ -199,13 +202,23 @@ async def player_button(client, callback_query):
             await call_module.call.resume(chat_id)
             notice = "Resumed."
         elif action == "skip":
+            # call.skip() fires on_track_change -> _update_now_playing_message,
+            # which re-renders this same card (new track, or "Playback
+            # finished" if the queue is now empty) - nothing more to do here.
             await call_module.call.skip(chat_id)
             notice = "Skipped."
         else:
+            # call.leave() also fires on_track_change -> clears the card.
             await call_module.call.leave(chat_id)
             notice = "Stopped."
+
         await callback_query.answer(notice)
-        if action != "stop":
+
+        # Pause/resume don't change the track, just refresh the markup
+        # (currently a no-op since the keyboard doesn't vary by play state,
+        # but harmless and keeps this correct if that ever changes).
+        if action in ("pause", "resume"):
             await _refresh_player(callback_query.message)
+
     except Exception as exc:
         await callback_query.answer(f"Playback action failed: {exc}", show_alert=True)
