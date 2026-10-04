@@ -45,7 +45,7 @@ async def play_cmd(client, message):
         return
 
     track = {
-        "url": info["url"],
+        "file_path": info["file_path"],
         "title": info["title"],
         "duration": info.get("duration") or 0,
         "thumbnail": info.get("thumbnail"),
@@ -55,7 +55,6 @@ async def play_cmd(client, message):
             if message.from_user
             else "someone"
         ),
-        "http_headers": info.get("http_headers") or {},
     }
 
     try:

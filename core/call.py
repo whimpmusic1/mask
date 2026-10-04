@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import os
+import shutil
 import time
 
 import pyrogram.errors
@@ -99,14 +101,39 @@ class Call:
         await self._play_next(chat_id)
 
     def _build_stream(self, track: dict) -> MediaStream:
-        """Build a PyTgCalls stream from the downloader's track dictionary."""
-        headers = track.get("http_headers") or {}
+        """
+        Build a PyTgCalls stream from the downloader's track dictionary.
+
+        Streams a local file (track["file_path"]) that core/downloader.py
+        has already fully downloaded, rather than a raw remote URL -
+        this is deliberate, see the note at the top of core/downloader.py
+        for why streaming a raw URL directly was unreliable.
+        """
         return MediaStream(
-            track["url"],
+            track["file_path"],
             audio_parameters=AudioQuality.HIGH,
             video_flags=MediaStream.Flags.IGNORE,
-            headers=headers,
         )
+
+    @staticmethod
+    def _cleanup_file(track: dict) -> None:
+        """
+        Removes the whole request-scoped download directory for this
+        track (see core/downloader.py - each download gets its own
+        unique directory), not just the one file. This also sweeps up
+        any yt-dlp temp/sidecar files and leaves nothing empty behind.
+        """
+        path = track.get("file_path")
+        if not path:
+            return
+        directory = os.path.dirname(path)
+        try:
+            shutil.rmtree(directory)
+            logger.info("Cleaned up download directory: %s", directory)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            logger.exception("Failed to clean up download directory: %s", directory)
 
     async def start(self):
         await self.pytgcalls.start()
@@ -129,13 +156,20 @@ class Call:
         """Start a stream, reusing a call if teardown is pending."""
         self._cancel_pending_leave(chat_id)
         await self._wait_for_join_cooldown(chat_id)
+        file_path = track.get("file_path")
+        file_size = None
+        if file_path:
+            try:
+                file_size = os.path.getsize(file_path)
+            except OSError:
+                file_size = None
         logger.info(
-            "Building stream in chat %s: title=%r duration=%r url_present=%s headers_present=%s",
+            "Building stream in chat %s: title=%r duration=%r file_path=%r file_size=%s",
             chat_id,
             track.get("title"),
             track.get("duration"),
-            bool(track.get("url")),
-            bool(track.get("http_headers")),
+            file_path,
+            file_size,
         )
         stream = self._build_stream(track)
 
@@ -158,6 +192,7 @@ class Call:
 
     async def _play_next(self, chat_id: int):
         queue = self.get_queue(chat_id)
+        finished_track = queue.current()  # captured before advance() pops it
         logger.info("Advancing queue in chat %s; size_before=%d", chat_id, len(queue.tracks))
         next_track = queue.advance()
         logger.info(
@@ -166,6 +201,9 @@ class Call:
             next_track.get("title") if next_track else None,
             len(queue.tracks),
         )
+
+        if finished_track is not None:
+            self._cleanup_file(finished_track)
 
         if next_track is None:
             await self._update_player(chat_id, None)
@@ -201,6 +239,7 @@ class Call:
                     await self._stream(chat_id, track)
                 except Exception:
                     queue.clear()
+                    self._cleanup_file(track)
                     raise
                 await self._update_player(chat_id, track)
                 return "playing"
@@ -270,7 +309,12 @@ class Call:
     async def _leave_locked(self, chat_id: int):
         self._cancel_pending_leave(chat_id)
         await self._update_player(chat_id, None)
-        self.queues.pop(chat_id, None)
+        queue = self.queues.pop(chat_id, None)
+        if queue is not None:
+            # Clean up the current track plus anything still queued -
+            # none of it will play now, so don't leave it on disk.
+            for leftover_track in queue.tracks:
+                self._cleanup_file(leftover_track)
         self.loop_remaining.pop(chat_id, None)
         self._active_chats.discard(chat_id)
         try:

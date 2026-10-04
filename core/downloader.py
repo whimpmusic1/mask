@@ -1,13 +1,19 @@
 import asyncio
 import logging
-import urllib.error
-import urllib.request
+import os
+import uuid
 
 import yt_dlp
 
 from config import Config
 
 logger = logging.getLogger(__name__)
+
+# Downloaded audio files live here, named by video id so repeat requests
+# in quick succession don't collide, and so cleanup (see core/call.py) is
+# a simple, reliable path lookup.
+DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", "/app/downloads")
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 
 _COMMON_OPTS = {
@@ -17,7 +23,6 @@ _COMMON_OPTS = {
     "default_search": "ytsearch",
     "geo_bypass": True,
     "nocheckcertificate": True,
-    "skip_download": True,
 
     # Use Node for current YouTube JavaScript challenges.
     "js_runtimes": {"node": {}},
@@ -41,7 +46,7 @@ _COMMON_OPTS = {
 if Config.YTDLP_COOKIES_FILE:
     _COMMON_OPTS["cookiefile"] = Config.YTDLP_COOKIES_FILE
     try:
-        size = __import__("os").path.getsize(Config.YTDLP_COOKIES_FILE)
+        size = os.path.getsize(Config.YTDLP_COOKIES_FILE)
         logger.info("yt-dlp cookie file ready: %s (%d bytes)", Config.YTDLP_COOKIES_FILE, size)
     except OSError:
         logger.warning("yt-dlp cookie file path exists in config but could not be stat'ed: %s", Config.YTDLP_COOKIES_FILE)
@@ -51,6 +56,47 @@ else:
         "'Sign in to confirm you're not a bot' errors, especially from a "
         "datacenter IP like Railway's."
     )
+
+
+# IMPORTANT architectural note (why this file downloads instead of
+# streaming a raw URL):
+#
+# The original version of this module resolved a direct CDN URL and
+# headers, and handed those straight to PyTgCalls/ffmpeg to fetch live at
+# play() time. That produced a reproducible bug: the voice chat join
+# would succeed and the UI would say "Now playing", but audio was
+# silent - sometimes for the track's entire duration - because the
+# actual media fetch (done separately by ffmpeg, with only the headers
+# we passed it) could fail or stall in ways that never surfaced as a
+# visible error. A warm-start retry workaround didn't fix it and
+# eventually crashed PyTgCalls' internals; a URL-reachability preflight
+# check didn't conclusively explain it either.
+#
+# Comparing against a known-working, widely-deployed Telegram music bot
+# (same pytgcalls/ffmpeg stack) showed it never streams a raw remote URL
+# at all for regular tracks - it downloads the file to local disk first,
+# then plays that local file. That sidesteps the entire class of
+# problem by construction: there is no live HTTP fetch happening at
+# play() time, so there's nothing for ffmpeg/pytgcalls to get stuck on.
+# This module now does the same thing.
+
+_AUDIO_OPTS = {
+    **_COMMON_OPTS,
+    "format": "bestaudio/best",
+    "postprocessors": [{
+        "key": "FFmpegExtractAudio",
+        # Opus is what Telegram voice chats use natively, so this also
+        # keeps file size down and avoids an extra transcode step later.
+        "preferredcodec": "opus",
+        "preferredquality": "128",
+    }],
+}
+
+_VIDEO_OPTS = {
+    **_COMMON_OPTS,
+    "format": "best[height<=480][ext=mp4]/best[height<=480]/best",
+    "merge_output_format": "mp4",
+}
 
 
 def _is_youtube_auth_error(exc: BaseException) -> bool:
@@ -63,10 +109,21 @@ def _is_youtube_auth_error(exc: BaseException) -> bool:
     )
 
 
-def _extract_with_opts(query: str, video: bool, opts: dict) -> dict:
-    logger.info("yt-dlp extracting: %s (player clients=%s)", query, opts.get("extractor_args", {}).get("youtube", {}).get("player_client"))
+def _expected_output_path(info: dict, video: bool, request_dir: str) -> str:
+    video_id = info["id"]
+    if video:
+        return os.path.join(request_dir, f"{video_id}_video.mp4")
+    return os.path.join(request_dir, f"{video_id}.opus")
+
+
+def _download_with_opts(query: str, video: bool, opts: dict) -> dict:
+    logger.info(
+        "yt-dlp downloading: %s (player clients=%s)",
+        query,
+        opts.get("extractor_args", {}).get("youtube", {}).get("player_client"),
+    )
     with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(query, download=False)
+        info = ydl.extract_info(query, download=True)
         if info.get("entries"):
             info = next((entry for entry in info["entries"] if entry), None)
         if not info:
@@ -74,18 +131,29 @@ def _extract_with_opts(query: str, video: bool, opts: dict) -> dict:
         return info
 
 
-def _extract(query: str, video: bool) -> dict:
-    opts = _VIDEO_OPTS if video else _AUDIO_OPTS
+def _download(query: str, video: bool) -> dict:
+    # A unique directory per request/download - never shared across
+    # chats or concurrent requests, so one chat's cleanup can never
+    # delete a file another chat is actively streaming, and simultaneous
+    # downloads of the identical video never collide on disk.
+    request_dir = os.path.join(DOWNLOAD_DIR, uuid.uuid4().hex)
+    os.makedirs(request_dir, exist_ok=True)
+
+    base_opts = _VIDEO_OPTS if video else _AUDIO_OPTS
+    outtmpl = os.path.join(
+        request_dir, "%(id)s_video.%(ext)s" if video else "%(id)s.%(ext)s"
+    )
+    opts = {**base_opts, "outtmpl": outtmpl}
+
     try:
-        return _extract_with_opts(query, video, opts)
+        info = _download_with_opts(query, video, opts)
     except Exception as exc:
         if not _is_youtube_auth_error(exc):
             raise
         logger.warning("YouTube rejected the first client with an authentication/bot check; retrying with alternate clients.")
 
-        # Retry without changing the cookie file or PO-token provider.
-        # This handles sessions where YouTube rejects one player client but
-        # accepts another with the same authenticated cookie jar.
+        info = None
+        last_exc = exc
         for client in ("web", "default"):
             retry_opts = dict(opts)
             retry_opts["extractor_args"] = {
@@ -96,140 +164,39 @@ def _extract(query: str, video: bool) -> dict:
                 },
             }
             try:
-                return _extract_with_opts(query, video, retry_opts)
+                info = _download_with_opts(query, video, retry_opts)
+                break
             except Exception as retry_exc:
+                last_exc = retry_exc
                 if not _is_youtube_auth_error(retry_exc):
                     raise
                 logger.warning("YouTube rejected player client %s as well.", client)
-        raise
+        if info is None:
+            raise last_exc
 
-
-_AUDIO_OPTS = {
-    **_COMMON_OPTS,
-    "format": "bestaudio/best",
-}
-
-
-_VIDEO_OPTS = {
-    **_COMMON_OPTS,
-    "format": "best[height<=480][ext=mp4]/best[height<=480]/best",
-}
-
-
-def _preflight_check(url: str, headers: dict) -> None:
-    """
-    Verify the resolved stream URL is actually fetchable with its headers
-    BEFORE handing it to PyTgCalls/ffmpeg.
-
-    Why this exists: a warm-start re-kick (repeatedly calling play() after
-    joining) did not fix reports of "joined the voice chat, UI says
-    playing, but total silence for several minutes" - and on its 3rd
-    retry it crashed inside PyTgCalls' own internals (reusing a
-    MediaStream object across multiple play() calls corrupts its internal
-    state). That ruled out "the connection just needs a nudge" as the
-    explanation. The next most likely cause: yt-dlp resolves URLs through
-    its own cookie/PO-token-aware HTTP stack, but ffmpeg (which is what
-    actually fetches the audio once PyTgCalls starts playing) makes a
-    plain request with only the headers we hand it - if those don't
-    match what the URL actually requires, ffmpeg's fetch can be silently
-    rejected while PyTgCalls still reports a successful *join* (joining
-    the voice chat and fetching the media are two separate things).
-
-    This makes that failure mode loud and immediate instead of 7 minutes
-    of silence: fetch a small range of the URL with the exact headers
-    ffmpeg will use, and raise a clear error before ever joining the call
-    if it's rejected.
-    """
-    request_headers = dict(headers)
-    request_headers.setdefault("Range", "bytes=0-8191")
-
-    req = urllib.request.Request(url, headers=request_headers)
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            chunk = resp.read(1024)
-            logger.info(
-                "Stream URL preflight OK: status=%s bytes_read=%d",
-                resp.status,
-                len(chunk),
-            )
-            if not chunk:
-                logger.warning(
-                    "Stream URL preflight got status %s but ZERO bytes "
-                    "back - this may still end up silent in playback.",
-                    resp.status,
-                )
-    except urllib.error.HTTPError as e:
-        logger.error(
-            "Stream URL preflight FAILED: HTTP %s %s - ffmpeg would "
-            "almost certainly have failed to fetch this too, which is "
-            "what produces 'joined but silent' rather than a visible "
-            "error. Headers sent: %s",
-            e.code,
-            e.reason,
-            sorted(request_headers.keys()),
+    file_path = _expected_output_path(info, video, request_dir)
+    if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+        raise RuntimeError(
+            f"yt-dlp reported success but the expected output file is "
+            f"missing or empty: {file_path}"
         )
-        if e.code in (401, 403, 404):
-            raise RuntimeError(
-                f"The resolved stream link was rejected (HTTP {e.code}) "
-                "when tested directly - it would not have played even "
-                "though joining the voice chat would have looked fine."
-            ) from e
-    except Exception as e:
-        # Don't hard-fail on non-HTTP errors (DNS blip, transient
-        # timeout) - log it clearly and let playback attempt proceed,
-        # since this check is a diagnostic/fast-fail aid, not a
-        # guarantee either way.
-        logger.error(
-            "Stream URL preflight error (%s): %s - proceeding anyway, "
-            "but if playback is silent this is the first place to look.",
-            type(e).__name__,
-            e,
-        )
+
+    logger.info(
+        "Download complete: %s (%d bytes) for %r",
+        file_path,
+        os.path.getsize(file_path),
+        info.get("title"),
+    )
+
+    return {
+        "title": info.get("title") or query,
+        "duration": info.get("duration") or 0,
+        "file_path": file_path,
+        "webpage_url": info.get("webpage_url"),
+        "thumbnail": info.get("thumbnail"),
+    }
 
 
 async def get_stream_info(query: str, video: bool = False) -> dict:
     loop = asyncio.get_running_loop()
-
-    info = await loop.run_in_executor(
-        None,
-        _extract,
-        query,
-        video,
-    )
-
-    stream_url = info.get("url")
-
-    if not stream_url and info.get("formats"):
-        audio_formats = [
-            fmt
-            for fmt in info["formats"]
-            if (
-                fmt.get("url")
-                and fmt.get("acodec") not in (None, "none")
-            )
-        ]
-
-        if audio_formats:
-            stream_url = audio_formats[-1]["url"]
-        else:
-            stream_url = info["formats"][-1].get("url")
-
-    if not stream_url:
-        raise RuntimeError(
-            "yt-dlp could not resolve a playable stream."
-        )
-
-    result = {
-        "title": info.get("title") or query,
-        "duration": info.get("duration") or 0,
-        "url": stream_url,
-        "webpage_url": info.get("webpage_url"),
-        "thumbnail": info.get("thumbnail"),
-        "http_headers": info.get("http_headers") or {},
-    }
-
-    await loop.run_in_executor(
-        None, _preflight_check, result["url"], result["http_headers"]
-    )
-
-    return result
+    return await loop.run_in_executor(None, _download, query, video)
